@@ -272,6 +272,21 @@ class ControllerActionsTests(unittest.TestCase):
         self.assertEqual(["rev-parse", f"{final_sha}^{{tree}}"], git_calls[-2])
         self.assertEqual(["diff", "--binary", "canonical-integration", final_sha], git_calls[-1])
 
+    def test_topology_finalize_receipt_forwards_immutable_sha_without_pr_head_read(self) -> None:
+        receipt = self.tmp / ".refactor-loop/state/publish-verification/jobs/receipt"
+        final_sha = "a" * 40
+        with mock.patch(
+            "codex_refactor_loop.controller_actions.mark_publish_verification_published"
+        ) as mark_published, mock.patch.object(
+            self.actions, "_topology_pr_head_sha", side_effect=AssertionError("mutable PR head must not be read")
+        ):
+            self.actions._topology_finalize_receipt(str(receipt), 41, final_sha)
+
+        kwargs = mark_published.call_args.kwargs
+        self.assertEqual((41, final_sha), (kwargs["pr_number"], kwargs["verified_sha"]))
+        self.assertEqual(self.tmp.resolve(), Path(kwargs["env"]["REPO_ROOT"]).resolve())
+        self.assertTrue(callable(kwargs["git_runner"]))
+
     def test_topology_read_retirement_maps_prs_sentinel_and_fails_closed_on_unavailable_pr(self) -> None:
         final_sha = "a" * 40
         review = ReviewGateProjection("MERGE", 41, final_sha, "review-digest")

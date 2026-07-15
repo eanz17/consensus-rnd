@@ -8,6 +8,7 @@ import json
 import math
 import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -497,16 +498,42 @@ def current_retry_status(job_dir: Path, *, now: float | None = None) -> PublishV
     return PublishVerificationRetryStatus("NO_RETRY", "", 0, None)
 
 
-def mark_published(job_dir: Path, *, pr_number: int, remote_oid: str) -> None:
-    _write_json(
-        job_dir / "published.json",
-        {
-            "schema": "PublishVerificationPublished",
-            "pr_number": pr_number,
-            "remote_oid": remote_oid,
-            "published_at_epoch": time.time(),
-        },
-    )
+def mark_published(
+    job_dir: Path,
+    *,
+    pr_number: int,
+    verified_sha: str,
+    env: Mapping[str, str],
+    git_runner: GitRunner | None = None,
+) -> None:
+    verified = validate_verified_receipt(job_dir, env=env, git_runner=git_runner)
+    if (not verified.ok or verified.verified_sha != verified_sha
+            or isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0):
+        raise RuntimeError("publication receipt identity is not verified")
+
+    path = verified.job_dir / "published.json"
+    payload = {
+        "schema": "PublishVerificationPublished",
+        "pr_number": pr_number,
+        "remote_oid": verified_sha,
+        "published_at_epoch": time.time(),
+    }
+    fd, temporary_name = tempfile.mkstemp(prefix=".published.", dir=verified.job_dir)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary_path, path)
+        except FileExistsError:
+            published = validate_published_receipt(verified.job_dir, env=env, git_runner=git_runner)
+            if not published.ok or published.pr_number != pr_number or published.remote_oid != verified_sha:
+                raise RuntimeError("existing publication receipt conflicts with verified identity")
+    finally:
+        temporary_path.unlink(missing_ok=True)
     (job_dir / "retry.json").unlink(missing_ok=True)
 
 

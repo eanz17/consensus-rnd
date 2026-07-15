@@ -361,7 +361,10 @@ class PublishVerificationTests(unittest.TestCase):
 
     def test_new_candidate_does_not_supersede_published_job(self) -> None:
         published = self._write_verified_receipt()
-        publish_verification.mark_published(published.job_dir, pr_number=414, remote_oid="a" * 40)
+        publish_verification.mark_published(
+            published.job_dir, pr_number=414, verified_sha="a" * 40,
+            env=self.env, git_runner=self._private_ref_git("a" * 40),
+        )
         newer = dict(self.identity)
         newer["candidate_sha"] = "b" * 40
 
@@ -373,16 +376,56 @@ class PublishVerificationTests(unittest.TestCase):
         self.assertTrue((published.job_dir / "published.json").is_file())
 
     def test_mark_published_records_pr_remote_oid_and_clears_retry_state(self) -> None:
-        result = self._prepared_job_without_child()
+        result = self._write_verified_receipt()
         publish_verification.record_job_retry(result.job_dir, "push-failed:7", now=1_000_000.0)
 
-        publish_verification.mark_published(result.job_dir, pr_number=414, remote_oid="a" * 40)
+        publish_verification.mark_published(
+            result.job_dir, pr_number=414, verified_sha="a" * 40,
+            env=self.env, git_runner=self._private_ref_git("a" * 40),
+        )
 
         payload = json.loads((result.job_dir / "published.json").read_text(encoding="utf-8"))
         self.assertEqual("PublishVerificationPublished", payload["schema"])
         self.assertEqual(414, payload["pr_number"])
         self.assertEqual("a" * 40, payload["remote_oid"])
         self.assertFalse((result.job_dir / "retry.json").exists())
+
+    def test_mark_published_adopts_exact_receipt_and_preserves_conflicts(self) -> None:
+        result = self._write_verified_receipt()
+        git = self._private_ref_git("a" * 40)
+        kwargs = {
+            "pr_number": 414, "verified_sha": "a" * 40,
+            "env": self.env, "git_runner": git,
+        }
+        publish_verification.mark_published(result.job_dir, **kwargs)
+        published_path = result.job_dir / "published.json"
+        exact_bytes = published_path.read_bytes()
+
+        publish_verification.mark_published(result.job_dir, **kwargs)
+        self.assertEqual(exact_bytes, published_path.read_bytes())
+
+        for label, payload in {
+            "conflicting-pr": {"schema": "PublishVerificationPublished", "pr_number": 415,
+                               "remote_oid": "a" * 40, "published_at_epoch": 1.0},
+            "conflicting-sha": {"schema": "PublishVerificationPublished", "pr_number": 414,
+                                "remote_oid": "b" * 40, "published_at_epoch": 1.0},
+            "malformed": {"schema": "PublishVerificationPublished", "pr_number": 414},
+        }.items():
+            with self.subTest(label=label):
+                published_path.write_text(json.dumps(payload), encoding="utf-8")
+                before = published_path.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "conflicts"):
+                    publish_verification.mark_published(result.job_dir, **kwargs)
+                self.assertEqual(before, published_path.read_bytes())
+
+    def test_mark_published_binds_immutable_verified_sha(self) -> None:
+        result = self._write_verified_receipt()
+        with self.assertRaisesRegex(RuntimeError, "identity is not verified"):
+            publish_verification.mark_published(
+                result.job_dir, pr_number=414, verified_sha="b" * 40,
+                env=self.env, git_runner=self._private_ref_git("a" * 40),
+            )
+        self.assertFalse((result.job_dir / "published.json").exists())
 
     def test_verified_and_published_receipt_tampering_fails_closed(self) -> None:
         result = self._write_verified_receipt()
@@ -426,7 +469,10 @@ class PublishVerificationTests(unittest.TestCase):
                 self.assertFalse(validated.ok)
         result_path.write_text(json.dumps(original_result), encoding="utf-8")
 
-        publish_verification.mark_published(result.job_dir, pr_number=414, remote_oid="a" * 40)
+        publish_verification.mark_published(
+            result.job_dir, pr_number=414, verified_sha="a" * 40,
+            env=self.env, git_runner=self._private_ref_git("a" * 40),
+        )
         published_path = result.job_dir / "published.json"
         original_published = json.loads(published_path.read_text(encoding="utf-8"))
         for label, row in {

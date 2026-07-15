@@ -366,9 +366,10 @@ class ControllerActions:
     def _topology_push_exact_ref(self, remote: str, branch: str, final_sha: str) -> None:
         self.git(["push", remote, f"{final_sha}:refs/heads/{branch}"])
 
-    def _topology_finalize_receipt(self, receipt_id: str, pr_number: int) -> None:
+    def _topology_finalize_receipt(self, receipt_id: str, pr_number: int, verified_sha: str) -> None:
         mark_publish_verification_published(
-            Path(receipt_id), pr_number=pr_number, remote_oid=self._topology_pr_head_sha(pr_number)
+            Path(receipt_id), pr_number=pr_number, verified_sha=verified_sha,
+            env=self.ctx.env_for_subprocess(), git_runner=lambda args: self.git(args, check=False),
         )
 
     def _topology_read_publication(self, request: PublishExactHeadRequest, worktree: Path) -> PublicationSnapshot:

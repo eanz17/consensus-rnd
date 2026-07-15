@@ -50,6 +50,7 @@ class FakePort:
         self.fail_effect = ""
         self.publication_override = None
         self.retirement_override = None
+        self.race_pr_head_on_receipt = False
 
     def _topology_require_fresh_owner(self, action):
         self.fresh_count += 1
@@ -113,10 +114,13 @@ class FakePort:
                            request.title_digest, request.body_digest, DIFF, (2737,)),)
         return 11
 
-    def _topology_finalize_receipt(self, receipt_id, pr_number):
+    def _topology_finalize_receipt(self, receipt_id, pr_number, verified_sha):
         self.calls.append("EFFECT:receipt")
         if self.fail_effect == "receipt": raise RuntimeError("receipt effect failed")
+        if verified_sha != F: raise AssertionError("receipt SHA changed")
         self.receipt = replace(self.receipt, status="PUBLISHED", pr_number=pr_number)
+        if self.race_pr_head_on_receipt:
+            self.prs = (replace(self.prs[0], head_sha="e" * 40),)
 
     def _topology_read_retirement(self, request, digest):
         self.calls.append("read-retirement")
@@ -183,6 +187,27 @@ class AuthorityTests(unittest.TestCase):
         record = self.port.records[f"publication:{self.identity.branch}"]
         self.assertEqual(2, record.generation)
         self.assertEqual(record, record.exact())
+
+    def test_receipt_retry_adopts_immutable_receipt_after_pr_head_race(self) -> None:
+        self._created()
+        self.port.race_pr_head_on_receipt = True
+
+        with self.assertRaisesRegex(ControllerTopologyError, "receipt finalization PR proof changed"):
+            self.owner.publish_exact_head(self.publish)
+
+        record = self.port.records[f"publication:{self.identity.branch}"]
+        self.assertEqual(TopologyPhase.PR_FINALIZED, record.phase)
+        self.assertEqual(("PUBLISHED", F, 11),
+                         (self.port.receipt.status, self.port.receipt.final_sha, self.port.receipt.pr_number))
+        self.assertEqual("e" * 40, self.port.prs[0].head_sha)
+        receipt_effects = self.port.calls.count("EFFECT:receipt")
+
+        self.port.race_pr_head_on_receipt = False
+        self.port.prs = (replace(self.port.prs[0], head_sha=F),)
+        result = self.owner.publish_exact_head(self.publish)
+
+        self.assertEqual(TopologyPhase.PUBLICATION_RECEIPT_FINALIZED, result.phase)
+        self.assertEqual(receipt_effects, self.port.calls.count("EFFECT:receipt"))
 
     def test_branch_only_partial_state_is_exactly_adopted_without_recreate(self):
         self.port.deny_at = 2
@@ -509,7 +534,7 @@ class AuthorityTests(unittest.TestCase):
                     port._topology_push_exact_ref = lambda remote, branch, sha: port.calls.append("EFFECT:push")
                 else:
                     original = port._topology_finalize_receipt
-                    port._topology_finalize_receipt = lambda receipt, pr: port.calls.append("EFFECT:receipt")
+                    port._topology_finalize_receipt = lambda receipt, pr, sha: port.calls.append("EFFECT:receipt")
                 with self.assertRaises(ControllerTopologyError): owner.publish_exact_head(self.publish)
                 self.assertEqual(phase, port.records[f"publication:{self.identity.branch}"].phase)
 

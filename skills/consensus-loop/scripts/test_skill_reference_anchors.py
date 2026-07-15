@@ -1463,12 +1463,10 @@ class SkillReferenceAnchorTests(unittest.TestCase):
             "progress-comment target extraction",
             "scripts/codex_refactor_loop/monitors/concurrency.py",
             "mutable/read-only dispatch `task_id` prefix classification",
-            "scripts/codex_refactor_loop/controller_actions.py",
-            "scripts/codex_refactor_loop/git.py",
+            "scripts/codex_refactor_loop/controller_topology_authority.py",
             "refactor/iter<I>-<cluster>",
-            "`ControllerActions.safe_worktree()` is the canonical branch-provenance writer",
-            "local admission evidence only, not a durable ownership claim",
-            "bounded legacy canonical implementation heads `refactor/iter<N>-issue-<N>`",
+            "`ControllerTopologyAuthority.create_compliant_worktree()` is the sole branch/worktree writer",
+            "`parse_legacy_implementation_head_evidence()` is the sole legacy grammar reader",
             "rollup/<integration_sha>",
             "scripts/codex_refactor_loop/labels.py",
             "crnd:<group>:<slug>",
@@ -1506,8 +1504,8 @@ class SkillReferenceAnchorTests(unittest.TestCase):
             "meta-judge-issue": {"monitors/concurrency.py", "phase9/router.py", "worker_markers.py"},
             "review-pr": {"controller_actions.py", "monitors/progress.py", "monitors/concurrency.py", "peek.py", "wakeup_plan.py", "wakeup_runner.py"},
             "fix-pr": {"monitors/progress.py", "monitors/concurrency.py", "review_fix_dispatch.py", "wakeup_runner.py"},
-            "crnd:": {"cross_instance_stand_down.py", "default_issue_intake.py", "issue_decomposition.py", "labels.py", "triage.py"},
-            "refactor/iter": {"controller_actions.py", "git.py", "implement_lifecycle.py", "wakeup_runner.py"},
+            "crnd:": {"controller_topology_authority.py", "cross_instance_stand_down.py", "default_issue_intake.py", "issue_decomposition.py", "labels.py", "triage.py", "wakeup_plan.py"},
+            "refactor/iter": {"controller_topology_authority.py"},
             "rollup/": {
                 "controller_actions.py",
                 "release/publisher.py",
@@ -1540,7 +1538,7 @@ class SkillReferenceAnchorTests(unittest.TestCase):
         self.assertNotIn("PROGRESS_PHASE9_TARGET_RE", progress)
         self.assertIn("MAIN_READONLY_DISPATCH_PATTERNS", concurrency)
         self.assertIn("SAFE_WORKTREE_CLUSTER_RE", controller_actions)
-        self.assertIn("SAFE_WORKTREE_CLUSTER_RE", git)
+        self.assertNotIn("SAFE_WORKTREE_CLUSTER_RE", git)
         progress_executable = "\n".join(line for line in progress.splitlines() if not line.lstrip().startswith("#"))
         self.assertNotIn(r"^phase9-issue([0-9]+).*", progress_executable)
 
@@ -1961,8 +1959,8 @@ class WakeupRunnerContractTests(unittest.TestCase):
             "`EXIT=0` evidence",
             "private ref OID",
             "not-superseded target",
-            "`git push origin <candidate_sha>:refs/heads/<head_ref>`",
-            "confirms remote OID equality before PR open/update",
+            "`ControllerTopologyAuthority.publish_exact_head`",
+            "canonical PR create/update/adoption",
             "`RETRY_WAIT` for 30min, then 2h, then 8h, then `QUARANTINED`",
             "no `publish_ratchet.py`",
             "no new long-lived daemon",
@@ -1972,11 +1970,11 @@ class WakeupRunnerContractTests(unittest.TestCase):
             "no issue/PR/label/tag/release authority",
             "no host production SSOT authority",
             "no second verification fact source",
-            "`suppressed_reason=pr_already_open_current`",
-            "returns 0 before diff/build/test/push/PR edit/reviewer dispatch",
-            "Remote ref proof is read-only and bounded",
-            "unknown or not-current evidence falls through to the existing publish path and is not success authority",
-            "duplicate/multiple PRs, head/base/link mismatch, unmanaged PRs",
+            "existing canonical PR is never standalone completion authority",
+            "only inside `publish_exact_head`",
+            "`PUBLICATION_RECEIPT_FINALIZED`",
+            "separate reviewer dispatch",
+            "sole eligible legacy PR as read-only evidence",
             "`implementation_refresh_needed:stale_base`",
             "named helper `dispatch_consensus_implementation`",
         ):
@@ -2023,13 +2021,13 @@ class WakeupRunnerContractTests(unittest.TestCase):
             "`refs/consensus/publish/<job_key>`",
             "`consensus-rnd-cli publish-verification-worker <job_dir>` helper-private child",
             "revalidated `VERIFIED` `result.json` receipt",
-            "`git push origin <candidate_sha>:refs/heads/<head_ref>`",
-            "confirming remote OID equality",
+            "owner-private `publish_exact_head`",
+            "`PUBLICATION_RECEIPT_FINALIZED`",
             "superseded jobs, or quarantined retry state fail closed",
-            "`publish_verification.py` job/receipt + literal-SHA finalizer",
-            "`suppressed_reason=pr_already_open_current`",
-            "Remote ref proof is read-only and bounded",
-            "duplicate/multiple/mismatch/unmanaged PRs fail closed",
+            "owner-private `publish_exact_head` terminal",
+            "adopted only inside `publish_exact_head`",
+            "separate reviewer dispatch",
+            "duplicate/multiple PRs, conflict PRs, head/base/link mismatch, unmanaged PRs",
             "conflict PRs, head/base/link mismatch, unmanaged PRs",
         ):
             with self.subTest(required=required):

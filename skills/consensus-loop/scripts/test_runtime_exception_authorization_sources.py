@@ -6,8 +6,11 @@ from __future__ import annotations
 import ast
 import re
 import subprocess
+import sys
 import unittest
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from test_support.authorization_projection import project_markdown, project_python
 
@@ -1084,12 +1087,12 @@ class RuntimeExceptionAuthorizationSourceTests(unittest.TestCase):
             "not a generic resume ticket",
             "not authority for issue/PR close/reopen/body/title/merge/tag/release actions",
             "spawns the implement worker; it does not commit, push, or open a PR",
-            "`suppressed_reason=pr_already_open_current`",
-            "returns 0 before diff/build/test/push/PR edit/reviewer dispatch",
-            "Remote ref proof is read-only and bounded",
-            "unknown or not-current evidence falls through to the existing publish path and is not success authority",
-            "duplicate/multiple PRs, head/base/link mismatch, unmanaged PRs",
-            "stale-base clean output fails closed/status-only",
+            "existing canonical PR is never standalone completion authority",
+            "only inside `publish_exact_head`",
+            "`PUBLICATION_RECEIPT_FINALIZED`",
+            "separate reviewer dispatch",
+            "sole eligible legacy PR as read-only evidence",
+            "stale-base clean",
             "spawn codex",
             "allowlisted `release-rollup-body` generation that only writes `.refactor-loop/runs/release-rollup-pr-body.md`",
             "named helper `dispatch_consensus_implementation`",
@@ -1126,8 +1129,10 @@ class RuntimeExceptionAuthorizationSourceTests(unittest.TestCase):
             "`EXIT=0` evidence",
             "private ref OID",
             "not-superseded target",
-            "`git push origin <candidate_sha>:refs/heads/<head_ref>`",
-            "confirms remote OID equality before PR open/update",
+            "owner-private `ControllerTopologyAuthority.publish_exact_head`",
+            "non-force configured-remote publication",
+            "canonical PR create/update/adoption",
+            "receipt finalization",
             "`RETRY_WAIT` for 30min, then 2h, then 8h, then `QUARANTINED`",
             "no `publish_ratchet.py`",
             "no new long-lived daemon",
@@ -2063,6 +2068,30 @@ class RuntimeExceptionAuthorizationSourceTests(unittest.TestCase):
                 self.assertNotIn(forbidden, section)
                 self.assertNotIn(forbidden, self.skill)
                 self.assertNotIn(forbidden, self.mirror)
+
+    def test_controller_topology_authority_is_a_closed_typed_runtime_exception(self) -> None:
+        section = mirror_entry(self.mirror, "controller-topology-authority")
+        for required in (
+            "ControllerTopologyAuthority",
+            "create_compliant_worktree(CreateCompliantWorktreeRequest)",
+            "publish_exact_head(PublishExactHeadRequest)",
+            "retire_superseded_pr(RetireSupersededPRRequest)",
+            "<type>/YYYY-MM-DD_<purpose>",
+            "exact `F`",
+            "close only the old PR",
+            "public CLI",
+            "wakeup-plan action",
+            "daemon",
+        ):
+            self.assertIn(required, section)
+        for forbidden_authority in ("command bus", "generic git/GitHub port", "public command"):
+            self.assertIn(forbidden_authority, section)
+        for token in (
+            "no-follow regular object", "exact bytes", "exact valid PR/SHA binding",
+            "provenance stores", "terminal reentry requires equality", "fresh #191",
+        ):
+            self.assertIn(token, self.skill)
+            self.assertIn(token, section)
 
 
 if __name__ == "__main__":

@@ -22,6 +22,10 @@ from typing import Any, Mapping
 
 from codex_refactor_loop import labels as label_catalog
 from codex_refactor_loop.context import LoopContext
+from codex_refactor_loop.controller_topology_authority import (
+    parse_legacy_implementation_head_evidence,
+    read_controller_topology_identity,
+)
 from codex_refactor_loop.consensus_gate import consensus_gate_digest, consensus_gate_file_digest
 from codex_refactor_loop.default_issue_intake import default_issue_intake_enabled
 from codex_refactor_loop.default_issue_intake_admission import (
@@ -221,7 +225,6 @@ REVIEW_LOG_RE = re.compile(r"^review-pr([1-9][0-9]*)-([A-Za-z][A-Za-z0-9_-]*)-r(
 REBASE_RESOLVE_LOG_RE = re.compile(r"^rebase-resolve-pr([1-9][0-9]*)-r([1-9][0-9]*)\.log$")
 REBASE_RESOLVE_DONE_RE = re.compile(r"^REBASE_RESOLVE_DONE:([1-9][0-9]*):[^\s`]+$")
 REBASE_RESOLVE_BLOCKED_RE = re.compile(r"^REBASE_RESOLVE_BLOCKED:([1-9][0-9]*):(conflict|human-decision|build-broken|other):[^\n]+$")
-MANAGED_PR_HEAD_PATTERN = re.compile("^" + "refactor/" + r"iter[1-9][0-9]*-[A-Za-z0-9._-]+$")
 REQUIRED_REVIEW_ROLES = ("architect", "tests", "quality")
 CONSENSUS_JUDGE_ARTIFACT_RE = re.compile(r"^phase9-issue([1-9][0-9]*)-r([1-9][0-9]*)-judge\.md$")
 CONSENSUS_JUDGE_LOG_RE = re.compile(r"^phase9-issue([1-9][0-9]*)-r([1-9][0-9]*)-judge\.log$")
@@ -658,7 +661,12 @@ def _render_audit_fallback_prompt(ctx: LoopContext, prompt: Path, task_id: str) 
 
 def _harness_spawn_intent_log_suppresses_retry(log_path: Path) -> bool:
     if is_implement_log(log_path):
-        state = classify_implement_attempt(repo_root=_repo_root_from_log(log_path), log_path=log_path)
+        repo_root = _repo_root_from_log(log_path)
+        state = classify_implement_attempt(
+            repo_root=repo_root,
+            action=_topology_identity_action_for_log(repo_root, log_path),
+            log_path=log_path,
+        )
         return state.in_flight or implement_attempt_is_terminal_or_noop_completion(state)
     if not log_path.exists():
         return False
@@ -737,8 +745,10 @@ def _revive_stale_redispatchable_implement_log(
         return False
     repo_root = _repo_root_from_log(log_path)
     runner = lambda command: git_text(list(command), cwd=repo_root)  # noqa: E731
+    identity_action = _topology_identity_action_for_log(repo_root, log_path)
     state = classify_implement_attempt(
         repo_root=repo_root,
+        action=identity_action,
         log_path=log_path,
         integration_branch=_integration_branch_from_env(),
         command_runner=runner,
@@ -1435,6 +1445,8 @@ def completed_marker_actions(
             action["preconditions"] = ["active_controller_owner", "clean_exit_source_marker", "live_open_target", "live_managed_target"]
         if action["controller_action"] == "publish_implementation_output":
             _attach_implementation_pr_artifacts(repo_root, action)
+            _attach_controller_topology_identity(repo_root, action)
+            _attach_legacy_publication_evidence(action, gh_items or [])
         _apply_remote_ci_fix_done_target_gate(action, open_targets)
         route = route_from_marker(marker)
         if route:
@@ -1443,6 +1455,7 @@ def completed_marker_actions(
             head_sha = _review_done_action_head_sha(repo_root, log_path, marker, gh_items)
             if head_sha:
                 action["head_sha"] = head_sha
+                _attach_controller_topology_retirement(action, gh_items or [], head_sha)
         if marker.startswith("META_JUDGE_DONE:consensus"):
             decomposition_fields = issue_decomposition_apply_fields(repo_root, log_path, item)
             if decomposition_fields:
@@ -3195,7 +3208,10 @@ def rebase_resolve_actions(
         if mergeable != "CONFLICTING" and merge_state != "DIRTY":
             continue
         head_ref = safe_head_ref(item.head_ref)
-        if not head_ref or MANAGED_PR_HEAD_PATTERN.fullmatch(head_ref) is None:
+        if not head_ref or not re.fullmatch(
+            r"(?:feat|fix|refactor|docs|test|chore)/\d{4}-\d{2}-\d{2}_[a-z0-9]+(?:-[a-z0-9]+)*",
+            head_ref,
+        ):
             continue
         if _rebase_resolve_in_flight(repo_root, item.number, monitor):
             actions.append(_rebase_resolve_status(item, "rebase_resolve_in_flight"))
@@ -4224,6 +4240,7 @@ def consensus_implementation_suppressed_reason(
     ctx: LoopContext | None = None,
     ignore_pending_implement_intent: bool = False,
 ) -> str | None:
+    _attach_controller_topology_identity(repo_root, action)
     target_kind = action.get("target_kind")
     target_number = action.get("target_number")
     if target_kind != "issue" or not isinstance(target_number, int):
@@ -4234,23 +4251,22 @@ def consensus_implementation_suppressed_reason(
             return "target_not_open"
         if _open_closing_pr_number(gh_items, target_number) is not None:
             return "open_closing_pr"
-    branch = _canonical_consensus_implementation_branch(action)
-    if not branch:
-        return "invalid_iter_branch"
-    lifecycle = classify_implement_attempt(
-        repo_root=repo_root,
-        action=action,
-        integration_branch=_integration_branch_from_env(),
-        command_runner=lambda command: git_text(list(command), cwd=repo_root),
-    )
-    if lifecycle.in_flight:
-        return "in_flight_implement"
-    if lifecycle.publish_ready or lifecycle.refresh_needed:
-        return "implementation_ready_to_publish"
+    if action.get("head_ref") and action.get("worktree"):
+        lifecycle = classify_implement_attempt(
+            repo_root=repo_root,
+            action=action,
+            integration_branch=_integration_branch_from_env(),
+            command_runner=lambda command: git_text(list(command), cwd=repo_root),
+        )
+        if lifecycle.in_flight:
+            return "in_flight_implement"
+        if lifecycle.publish_ready or lifecycle.refresh_needed:
+            return "implementation_ready_to_publish"
     if (
         not ignore_pending_implement_intent
         # Stale queued intents can point at deleted worktrees; allow fresh dispatch to recreate them.
-        and _canonical_consensus_worktree_exists(repo_root, action)
+        and action.get("worktree")
+        and Path(str(action["worktree"])).is_dir()
     ):
         pending_intent_exists = _pending_implement_intent_exists(repo_root, target_number, action, ctx=ctx)
         if pending_intent_exists is None:
@@ -4259,23 +4275,11 @@ def consensus_implementation_suppressed_reason(
             return "pending_implement_intent"
     if _in_flight_implement_exists(repo_root, action, monitor):
         return "in_flight_implement"
-    if gh_items is not None and _open_pr_exists_for_branch(gh_items, branch):
-        return "open_closing_pr"
-    if _remote_iter_branch_exists(repo_root, branch) and not _local_iter_branch_exists(repo_root, branch):
-        return "remote_iter_branch"
     return None
 
 
 def _integration_branch_from_env() -> str:
     return str(os.environ.get("INTEGRATION_BRANCH") or "auto-refact-dev").strip()
-
-
-def _canonical_consensus_implementation_branch(action: dict[str, Any]) -> str:
-    iteration = str(action.get("iteration") or "").strip()
-    cluster_id = str(action.get("cluster_id") or "").strip()
-    if not SAFE_WORKTREE_ITERATION_RE.fullmatch(iteration) or not SAFE_WORKTREE_CLUSTER_RE.fullmatch(cluster_id):
-        return ""
-    return "refactor/" + f"iter{iteration}-{cluster_id}"
 
 
 SAFE_WORKTREE_ITERATION_RE = re.compile(r"^[0-9]+$")
@@ -4301,14 +4305,6 @@ def _local_iter_branch_exists(repo_root: Path, branch: str) -> bool:
 def _remote_iter_branch_exists(repo_root: Path, branch: str) -> bool:
     result = git_text(["git", "-C", str(repo_root), "rev-parse", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo_root)
     return result.returncode == 0
-
-
-def _canonical_consensus_worktree_exists(repo_root: Path, action: dict[str, Any]) -> bool:
-    iteration = str(action.get("iteration") or "").strip()
-    cluster_id = str(action.get("cluster_id") or "").strip()
-    if not iteration or not cluster_id:
-        return False
-    return (repo_root / ".worktrees" / f"iter{iteration}-{cluster_id}").is_dir()
 
 
 def _implement_log_exists(repo_root: Path, action: dict[str, Any]) -> bool:
@@ -4895,10 +4891,20 @@ def _stale_publish_implementation_reason(
     if current_pr.current:
         if current_pr.pr_number is not None:
             action["target_pr_number"] = current_pr.pr_number
-        return "pr_already_open_current"
     artifact_reason = _implementation_pr_artifact_invalid_reason(action, repo_root)
     if artifact_reason:
         return artifact_reason
+    if target is not None and target[0] == "issue":
+        legacy = [
+            item for item in gh_items
+            if item.kind == "PR"
+            and item.head_ref
+            and parse_legacy_implementation_head_evidence(item.head_ref) is not None
+            and extract_closing_issue_numbers(item.body) == (target[1],)
+        ]
+        if len(legacy) != 1:
+            return "legacy_implementation_pr_evidence_missing_or_ambiguous"
+        action["legacy_pr_number"] = legacy[0].number
     preconditions = list(action.get("preconditions") if isinstance(action.get("preconditions"), list) else [])
     for required in (
         "canonical_implementation_identity",
@@ -5178,36 +5184,93 @@ def _single_linked_issue_from_body(body: str) -> int | None:
     return numbers[0] if len(numbers) == 1 else None
 
 
+def _attach_controller_topology_retirement(
+    action: dict[str, Any],
+    gh_items: list[GhItem],
+    live_head_sha: str,
+) -> None:
+    replacement_number = action.get("target_number")
+    if not isinstance(replacement_number, int):
+        return
+    replacement = next(
+        (item for item in gh_items if item.kind == "PR" and item.number == replacement_number),
+        None,
+    )
+    if replacement is None or replacement.head_sha != live_head_sha:
+        return
+    linked_issue = _single_linked_issue_from_body(replacement.body)
+    if linked_issue is None:
+        return
+    legacy = [
+        item
+        for item in gh_items
+        if item.kind == "PR"
+        and item.number != replacement_number
+        and item.head_ref
+        and parse_legacy_implementation_head_evidence(item.head_ref) is not None
+        and _single_linked_issue_from_body(item.body) == linked_issue
+    ]
+    if len(legacy) != 1:
+        return
+    action.update(
+        {
+            "superseded_pr_number": legacy[0].number,
+            "linked_issue": linked_issue,
+            "base_ref": _integration_branch_from_env(),
+            "supersession_body": (
+                f"Superseded by replacement PR #{replacement_number} for issue #{linked_issue}.\n\n"
+                "The controller verified the exact head, tree, diff, base, linked issue, and review evidence "
+                "before retiring this PR.\n\n"
+                "<!-- crnd:controller-topology-supersession -->\n"
+            ),
+        }
+    )
+
+
 def _worktree_has_non_empty_diff(worktree: Path) -> bool:
     diff = git_text(["git", "-C", str(worktree), "diff", "HEAD", "--quiet"], cwd=worktree)
     return diff.returncode == 1
 
 
 def _implementation_head_ref(action: dict[str, Any], target: tuple[str, int] | None) -> str | None:
-    explicit = safe_head_ref(str(action.get("head_ref") or ""))
-    if explicit:
-        return explicit
-    if target is None or target[0] != "issue":
-        return None
-    marker = str(action.get("source_marker") or "")
-    candidates: list[str] = []
-    marker_id = marker.removeprefix("IMPLEMENT_DONE:")
-    marker_parts = marker_id.split(":")
-    if len(marker_parts) == 2 and marker_parts[1] in {"ok", "partial", "blocked"}:
-        marker_id = marker_parts[0]
-    marker_id = marker_id.strip(":")
-    if marker_id:
-        candidates.append(marker_id)
-    candidates.append(f"issue-{target[1]}")
-    candidates.append(f"issue{target[1]}")
-    for candidate in candidates:
-        normalized = candidate.replace("_", "-").strip("-")
-        if not normalized:
-            continue
-        ref = safe_head_ref("refactor/" + f"iter{target[1]}-{normalized}")
-        if ref:
-            return ref
-    return None
+    # The create transaction is the only canonical identity writer.  Planning
+    # may project its durable output but must never reconstruct a branch.
+    return safe_head_ref(str(action.get("head_ref") or ""))
+
+
+def _attach_controller_topology_identity(repo_root: Path, action: dict[str, Any]) -> None:
+    issue = action.get("target_number")
+    if not isinstance(issue, int):
+        return
+    identity = read_controller_topology_identity(repo_root, issue)
+    if identity is not None:
+        action["head_ref"], worktree = identity
+        action["worktree"] = str(worktree)
+
+
+def _topology_identity_action_for_log(repo_root: Path, log_path: Path) -> dict[str, Any]:
+    action: dict[str, Any] = {}
+    issue_match = re.fullmatch(r"implement-issue-?([1-9][0-9]*)\.log", log_path.name)
+    if issue_match is not None:
+        action["target_number"] = int(issue_match.group(1))
+        _attach_controller_topology_identity(repo_root, action)
+    return action
+
+
+def _attach_legacy_publication_evidence(action: dict[str, Any], gh_items: list[GhItem]) -> None:
+    issue = action.get("target_number")
+    if not isinstance(issue, int):
+        return
+    matches = [
+        item
+        for item in gh_items
+        if item.kind == "PR"
+        and item.head_ref
+        and parse_legacy_implementation_head_evidence(item.head_ref) is not None
+        and extract_closing_issue_numbers(item.body) == (issue,)
+    ]
+    if len(matches) == 1:
+        action["legacy_pr_number"] = matches[0].number
 
 
 def _implementation_cluster_id(action: Mapping[str, Any], issue_target: int) -> str:

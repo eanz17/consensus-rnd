@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from codex_refactor_loop.context import LoopContext
+from codex_refactor_loop.controller_topology_authority import (
+    RetireSupersededPRResult,
+    ReviewGateProjection,
+    TopologyPhase,
+)
 from codex_refactor_loop.consensus_gate import consensus_gate_digest, consensus_gate_file_digest
 from codex_refactor_loop.daemon_progress import begin_tick
 from codex_refactor_loop.issue_decomposition import (
@@ -204,6 +210,18 @@ class FakeActions:
     def publish_implementation_output(self, action: dict) -> int:
         self.calls.append(("publish_implementation_output", dict(action)))
         return self.publish_code
+
+    def _topology_review_projection(self, pr_number: int, head_sha: str, decision: str):
+        return ReviewGateProjection(decision, pr_number, head_sha, "evidence-digest")
+
+    def _retire_superseded_pr(self, request):
+        self.calls.append(("retire_superseded_pr", request))
+        return RetireSupersededPRResult(
+            request.old_pr_number,
+            request.replacement_pr_number,
+            TopologyPhase.OLD_PR_CLOSED,
+            "comment",
+        )
 
     def dispatch_consensus_implementation(self, action: dict) -> int:
         self.calls.append(("dispatch_consensus_implementation", dict(action)))
@@ -1095,6 +1113,39 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
         issue_state_labels_result: subprocess.CompletedProcess[str] | None = None,
         dry_run: bool = False,
     ) -> list:
+        for action in plan.get("actions", []):
+            if action.get("controller_action") == "review_gate":
+                action.setdefault("superseded_pr_number", 76)
+                action.setdefault("linked_issue", 77)
+                action.setdefault("base_ref", "main")
+                action.setdefault(
+                    "supersession_body",
+                    "Superseded by replacement PR #77.\n\n<!-- crnd:controller-topology-supersession -->\n",
+                )
+            if action.get("controller_action") != "publish_implementation_output":
+                continue
+            legacy = re.fullmatch(r"refactor/iter([1-9][0-9]*)-[A-Za-z0-9._-]+", str(action.get("head_ref") or ""))
+            if legacy is None:
+                continue
+            issue = int(legacy.group(1))
+            canonical = f"refactor/2026-07-15_issue-{issue}"
+            worktree = self.repo / ".worktrees" / canonical.replace("/", "__")
+            worktree.mkdir(parents=True, exist_ok=True)
+            action["head_ref"] = canonical
+            action["worktree"] = str(worktree)
+        projected_head_ref = gh_head_ref
+        if gh_head_ref == "refactor/iter77-worker":
+            projected_head_ref = next(
+                (
+                    str(action.get("head_ref"))
+                    for action in plan.get("actions", [])
+                    if action.get("target_number") == 77
+                    and action.get("head_ref")
+                    and action.get("controller_action")
+                    in {"safe_push", "dispatch_pr_rebase_resolve", "commit_push_resolved_pr_rebase"}
+                ),
+                gh_head_ref,
+            )
         def command_runner(command):
             if command[:2] == ["gh", "api"]:
                 endpoint = str(command[2]) if len(command) > 2 else ""
@@ -1146,7 +1197,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                         {
                             "number": 99,
                             "baseRefName": "auto-refact-dev",
-                            "headRefName": "refactor/iter77-issue-77",
+                            "headRefName": "refactor/2026-07-15_issue-77",
                             "labels": [{"name": labels.MANAGED}],
                             "body": "Closes #77\n",
                         }
@@ -1173,8 +1224,8 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                     return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
                 if "headRefName" in command:
                     if "--jq" not in command:
-                        return subprocess.CompletedProcess(command, 0, json.dumps({"headRefName": gh_head_ref}), "")
-                    return subprocess.CompletedProcess(command, 0, gh_head_ref + "\n", "")
+                        return subprocess.CompletedProcess(command, 0, json.dumps({"headRefName": projected_head_ref}), "")
+                    return subprocess.CompletedProcess(command, 0, projected_head_ref + "\n", "")
                 if "baseRefName,headRefOid,mergeStateStatus" in command:
                     return subprocess.CompletedProcess(
                         command,
@@ -1193,13 +1244,14 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             repo_root = self.ctx.repo_root
             if git_cwd == (self.repo / ".worktrees" / "pr77").resolve():
                 return subprocess.CompletedProcess(command, git_diff_code, "", "")
-            if git_cwd == (self.repo / ".worktrees" / f"iter{implementation_issue}-issue-{implementation_issue}").resolve():
+            canonical_implementation = f"refactor/2026-07-15_issue-{implementation_issue}"
+            if git_cwd == (self.repo / ".worktrees" / canonical_implementation.replace("/", "__")).resolve():
                 if command[3:] == ["status", "--porcelain"]:
                     return subprocess.CompletedProcess(command, 0, implementation_status or "", "")
                 if command[3:] == ["diff", "HEAD", "--quiet"]:
                     return subprocess.CompletedProcess(command, git_diff_code, "", "")
                 if command[3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, f"refactor/iter{implementation_issue}-issue-{implementation_issue}\n", "")
+                    return subprocess.CompletedProcess(command, 0, canonical_implementation + "\n", "")
                 if command[3:] == ["merge-base", "HEAD", "origin/auto-refact-dev"]:
                     return subprocess.CompletedProcess(command, 0, implementation_base[0] + "\n", "")
                 if command[3:] == ["rev-parse", "--verify", "origin/auto-refact-dev"]:
@@ -1511,7 +1563,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             "target_kind": "PR",
             "target_number": 77,
             "target": {"kind": "PR", "number": 77},
-            "head_ref": "refactor/iter77-worker",
+            "head_ref": "refactor/2026-07-15_issue-77",
             "controller_action": "dispatch_pr_rebase_resolve",
             "no_generic_command": True,
         }
@@ -1522,7 +1574,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
         log = self.repo / ".refactor-loop/logs/rebase-resolve-pr77-r1.log"
         log.parent.mkdir(parents=True, exist_ok=True)
         log.write_text("resolved\nREBASE_RESOLVE_DONE:77:ok\nEXIT=0\n", encoding="utf-8")
-        worktree = self.repo / ".worktrees" / "iter77-worker"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-77"
         worktree.mkdir(parents=True, exist_ok=True)
         action = {
             "kind": "completed-marker",
@@ -1534,7 +1586,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             "target_kind": "PR",
             "target_number": 77,
             "target": {"kind": "PR", "number": 77},
-            "head_ref": "refactor/iter77-worker",
+            "head_ref": "refactor/2026-07-15_issue-77",
             "worktree": str(worktree),
             "controller_action": "commit_push_resolved_pr_rebase",
             "no_generic_command": True,
@@ -2181,7 +2233,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
         )
 
     def test_wakeup_runner_stale_applied_spawn_ledger_does_not_retry_empty_scoped_diff_implement(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter581-issue-581"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-581"
         worktree.mkdir(parents=True)
         log = self.repo / ".refactor-loop/logs/implement-issue-581.log"
         log.write_text("no code changes required\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n", encoding="utf-8")
@@ -2189,6 +2241,8 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             action_id="harness-spawn-intent:dispatch-consensus-implementation:581",
             target={"kind": "codex", "task_id": "implement-issue-581"},
             log=str(log),
+            head_ref="refactor/2026-07-15_issue-581",
+            worktree=str(worktree),
         )
         ledger = self.repo / ".refactor-loop/state/wakeup-runner-ledger.jsonl"
         ledger.write_text(
@@ -2856,7 +2910,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             ],
         )
         self.assertEqual(launch.call_count, 2)
-        self.assertEqual(actions.calls, [("merge_pr", "77")])
+        self.assertEqual([call[0] for call in actions.calls], ["retire_superseded_pr", "merge_pr"])
 
     def test_hard_gate_review_gate_merge_preempts_same_pr_review_dispatch_and_top_up_continues(self) -> None:
         self.add_review_comments({"architect": "approve", "tests": "approve", "quality": "comment"})
@@ -2904,9 +2958,12 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                 ("review-evidence-redispatch:78:" + "a" * 40, "applied", ""),
             ],
         )
-        self.assertEqual([call[0] for call in actions.calls], ["merge_pr", "dispatch_reviewers"])
-        self.assertEqual(actions.calls[0][1], "77")
-        self.assertEqual(actions.calls[1][1]["target_number"], 78)
+        self.assertEqual(
+            [call[0] for call in actions.calls],
+            ["retire_superseded_pr", "merge_pr", "dispatch_reviewers"],
+        )
+        self.assertEqual(actions.calls[1][1], "77")
+        self.assertEqual(actions.calls[2][1]["target_number"], 78)
 
     def test_same_tick_terminal_pr_skips_fix_worker_spawn_after_successful_merge(self) -> None:
         self.add_review_comments({"architect": "approve", "tests": "approve", "quality": "approve"})
@@ -2935,7 +2992,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                 ("harness-spawn-intent:fix-pr77-round-1", "skipped", "same_tick_terminal_target:MERGED"),
             ],
         )
-        self.assertEqual(actions.calls, [("merge_pr", "77")])
+        self.assertEqual([call[0] for call in actions.calls], ["retire_superseded_pr", "merge_pr"])
         launch.assert_not_called()
 
     def test_hard_gate_release_rollup_open_pr_is_not_starved_by_spawn_budget(self) -> None:
@@ -5080,7 +5137,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                 {
                     "number": 99,
                     "baseRefName": "auto-refact-dev",
-                    "headRefName": "refactor/iter77-issue-77",
+                    "headRefName": "refactor/2026-07-15_issue-77",
                     "labels": [{"name": labels.MANAGED}],
                     "body": "Closes #77\n",
                 }
@@ -5094,7 +5151,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
     def test_wakeup_runner_source_locks_publish_refresh_needed_and_matching_pr_contract(self) -> None:
         source = (SCRIPT_DIR / "codex_refactor_loop" / "wakeup_runner.py").read_text(encoding="utf-8")
         publish_validator = source[source.index("    def _validate_publish_implementation") : source.index("    def _validate_dispatch_reviewers")]
-        worktree_validator = source[source.index("    def _validate_implementation_worktree") : source.index("    def _validate_canonical_implementation_identity")]
+        worktree_validator = source[source.index("    def _validate_implementation_worktree") : source.index("    def _dispatch")]
         self.assertNotIn("publish_implementation_stale_base", publish_validator + worktree_validator)
         self.assertNotIn("merge-base", publish_validator + worktree_validator)
         self.assertNotIn("def _validate_no_duplicate_open_pr", source)
@@ -5491,7 +5548,13 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
 
     def test_dispatch_consensus_implementation_blocks_inflight_implement_log(self) -> None:
         actions = FakeActions()
-        action = self.consensus_action(action_id="consensus:inflight-log")
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
+        worktree.mkdir(parents=True, exist_ok=True)
+        action = self.consensus_action(
+            action_id="consensus:inflight-log",
+            head_ref="refactor/2026-07-15_issue-20",
+            worktree=str(worktree),
+        )
         log = self.repo / ".refactor-loop/logs/implement-issue-20.log"
         log.write_text("worker still running\n", encoding="utf-8")
 
@@ -5654,6 +5717,9 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
 
     def test_publish_implementation_output_allows_missing_matching_pr_before_helper(self) -> None:
         actions = FakeActions()
+        head_ref = "refactor/2026-07-15_issue-77"
+        worktree = self.repo / ".worktrees" / head_ref.replace("/", "__")
+        worktree.mkdir(parents=True, exist_ok=True)
 
         def command_runner(command):
             if command[:2] == ["gh", "api"]:
@@ -5665,9 +5731,9 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, json.dumps({"labels": [{"name": labels.MANAGED}], "body": ""}), "")
             if command[:4] == ["gh", "pr", "list", "--state"]:
                 return subprocess.CompletedProcess(command, 0, "[]", "")
-            if command[:3] == ["git", "-C", str(self.repo / ".worktrees" / "iter77-issue-77")]:
+            if command[:3] == ["git", "-C", str(worktree)]:
                 if command[3:] == ["rev-parse", "--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, "refactor/iter77-issue-77\n", "")
+                    return subprocess.CompletedProcess(command, 0, head_ref + "\n", "")
                 if command[3:] == ["status", "--porcelain"]:
                     return subprocess.CompletedProcess(command, 0, "M  staged.py\n", "")
                 if command[3:] == ["diff", "HEAD", "--quiet"]:
@@ -5676,7 +5742,9 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
 
         runner = WakeupRunner(
             self.ctx,
-            plan_loader=lambda _repo: self.base_plan(self.implementation_output_action()),
+            plan_loader=lambda _repo: self.base_plan(
+                self.implementation_output_action(head_ref=head_ref, worktree=str(worktree))
+            ),
             actions=actions,
             supervisor=self.supervisor,
             command_runner=command_runner,
@@ -6392,6 +6460,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
     def test_zero_code_implementation_completion_routes_to_close_helper_after_empty_diff_revalidation(self) -> None:
         actions = FakeActions()
         marker = "IMPLEMENT_DONE:issue-77:ok"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-77"
         action = self.close_action(
             action_id="completed-marker:implement-issue-77.log:" + marker,
             preconditions=[
@@ -6406,10 +6475,12 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             target_number=77,
             target={"kind": "issue", "number": 77},
             zero_code_completion_proof=self.write_zero_code_completion_artifacts(issue=77),
+            head_ref="refactor/2026-07-15_issue-77",
+            worktree=str(worktree),
         )
         log = self.repo / ".refactor-loop/logs/implement-issue-77.log"
         log.write_text("worker artifact: 0 LOC no source changes\n" + marker + "\nEXIT=0\n", encoding="utf-8")
-        (self.repo / ".worktrees" / "iter77-issue-77").mkdir(parents=True, exist_ok=True)
+        worktree.mkdir(parents=True, exist_ok=True)
 
         results = self.run_result(
             self.base_plan(action),
@@ -6428,6 +6499,7 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
     def test_zero_code_implementation_close_blocks_when_diff_not_empty(self) -> None:
         actions = FakeActions()
         marker = "IMPLEMENT_DONE:issue-77:ok"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-77"
         action = self.close_action(
             action_id="completed-marker:implement-issue-77.log:" + marker,
             preconditions=[
@@ -6442,10 +6514,12 @@ class WakeupRunnerBehaviorTests(unittest.TestCase):
             target_number=77,
             target={"kind": "issue", "number": 77},
             zero_code_completion_proof=self.write_zero_code_completion_artifacts(issue=77),
+            head_ref="refactor/2026-07-15_issue-77",
+            worktree=str(worktree),
         )
         log = self.repo / ".refactor-loop/logs/implement-issue-77.log"
         log.write_text(marker + "\nEXIT=0\n", encoding="utf-8")
-        (self.repo / ".worktrees" / "iter77-issue-77").mkdir(parents=True, exist_ok=True)
+        worktree.mkdir(parents=True, exist_ok=True)
 
         results = self.run_result(
             self.base_plan(action),

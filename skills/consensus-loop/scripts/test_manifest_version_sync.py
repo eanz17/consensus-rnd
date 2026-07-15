@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from codex_refactor_loop.checks.manifest import (
     ManifestVersionSyncError,
     check_manifest_version_sync,

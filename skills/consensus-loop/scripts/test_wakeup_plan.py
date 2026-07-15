@@ -27,6 +27,7 @@ sys.path.insert(0, str(SKILL_ROOT / "scripts"))
 
 from codex_refactor_loop import labels as label_catalog  # noqa: E402
 from codex_refactor_loop.context import LoopContext  # noqa: E402
+from codex_refactor_loop.controller_topology_authority import TopologyPhase, TopologyProvenance  # noqa: E402
 from codex_refactor_loop.issue_decomposition import issue_decomposition_child_fingerprint, issue_decomposition_plan_file_digest  # noqa: E402
 from codex_refactor_loop.managed_work_snapshot import ManagedWorkSnapshotResult  # noqa: E402
 from codex_refactor_loop.release.gate import canonical_digest, isoformat  # noqa: E402
@@ -74,6 +75,20 @@ from codex_refactor_loop.wakeup_plan import (  # noqa: E402
     default_issue_intake_actions,
     load_default_issue_intake_candidates,
 )
+
+
+def _write_publication_topology(repo: Path, issue: int) -> None:
+    branch = f"refactor/2026-07-15_issue-{issue}"
+    record = TopologyProvenance(
+        f"publication:{branch}", TopologyPhase.WORKTREE_CREATED, 2, "", issue, f"issue-{issue}",
+        "refactor", "2026-07-15", branch, str(repo / ".worktrees" / branch.replace("/", "__")),
+        "origin/dev", "b" * 40,
+    ).exact()
+    topology = repo / ".refactor-loop/state/controller-topology"
+    topology.mkdir(parents=True, exist_ok=True)
+    (topology / f"publication__{branch.replace('/', '__')}.json").write_text(
+        json.dumps({**record.payload(), "digest": record.digest}), encoding="utf-8"
+    )
 from codex_refactor_loop.reviewer_liveness import reviewer_liveness_projection  # noqa: E402
 from test_support.authorization_projection import project_python  # noqa: E402
 
@@ -148,6 +163,8 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         (self.repo / ".refactor-loop" / ".controller-pending-events.log").write_text("", encoding="utf-8")
         state_dir = self.repo / ".refactor-loop" / "state"
         state_dir.mkdir()
+        for issue in (20, 581):
+            _write_publication_topology(self.repo, issue)
         (state_dir / "auto-release-signals.json").write_text(json.dumps({"recent_pr_merges": 0}), encoding="utf-8")
         (self.repo / ".version-bump.json").write_text(
             json.dumps({"files": [{"path": "package.json", "field": "version"}]}),
@@ -168,7 +185,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
             mergeable="CONFLICTING",
         )
@@ -365,7 +382,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
 
         suppressed = completed_marker_action(plan, "completed-marker:implement-issue507")
         self.assertTrue(suppressed["status_only"])
-        self.assertEqual("implementation_worktree_missing", suppressed["suppressed_reason"])
+        self.assertEqual("implementation_head_ref_missing", suppressed["suppressed_reason"])
         intake_actions = [action for action in plan["actions"] if action["kind"] == "default-issue-intake-claim"]
         self.assertEqual([610], [action["target_number"] for action in intake_actions])
         self.assertTrue(has_dispatchable_action(intake_actions))
@@ -391,7 +408,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
             mergeable="",
             merge_state_status="",
@@ -432,7 +449,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
             mergeable="CONFLICTING",
         )
@@ -448,7 +465,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
             mergeable="CONFLICTING",
         )
@@ -478,13 +495,13 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         log.write_text("resolved\nREBASE_RESOLVE_DONE:77:ok\nEXIT=0\n", encoding="utf-8")
         worktree = self.repo / ".worktrees" / "iter77-stale"
         worktree.mkdir(parents=True)
-        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/iter77-stale\n"
+        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/2026-07-15_issue-77\n"
         item = GhItem(
             kind="PR",
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
         )
         git_dir = self.repo / ".git" / "worktrees" / "iter77-stale"
@@ -514,13 +531,13 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         log.write_text("resolved\nREBASE_RESOLVE_DONE:77:ok\nEXIT=0\n", encoding="utf-8")
         worktree = self.repo / ".worktrees" / "iter77-stale"
         worktree.mkdir(parents=True)
-        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/iter77-stale\n"
+        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/2026-07-15_issue-77\n"
         item = GhItem(
             kind="PR",
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
         )
         git_dir = self.repo / ".git" / "worktrees" / "iter77-stale"
@@ -571,10 +588,10 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
         )
-        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/iter77-stale\n"
+        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/2026-07-15_issue-77\n"
 
         def fake_git(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
             if command == ["git", "-C", str(self.repo), "worktree", "list", "--porcelain"]:
@@ -594,7 +611,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertEqual(str(worktree), action["worktree"])
         self.assertEqual("PR", action["target_kind"])
         self.assertEqual(77, action["target_number"])
-        self.assertEqual("refactor/iter77-stale", action["head_ref"])
+        self.assertEqual("refactor/2026-07-15_issue-77", action["head_ref"])
         self.assertNotIn("mode", action)
         self.assertEqual(
             [
@@ -614,13 +631,13 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
         )
         worktree = self.repo / ".worktrees" / "iter77-stale"
         worktree.mkdir(parents=True)
-        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/iter77-stale\n"
-        state = {"PR:77:refactor/iter77-stale": {"count": 2}}
+        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/2026-07-15_issue-77\n"
+        state = {"PR:77:refactor/2026-07-15_issue-77": {"count": 2}}
         (self.repo / ".refactor-loop" / "state" / "rebase-resolve-false-done-recovery.json").write_text(
             json.dumps(state), encoding="utf-8"
         )
@@ -648,12 +665,12 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
         )
         worktree = self.repo / ".worktrees" / "iter77-stale"
         worktree.mkdir(parents=True)
-        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/iter77-stale\n"
+        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/2026-07-15_issue-77\n"
         state_path = self.repo / ".refactor-loop" / "state" / "rebase-resolve-false-done-recovery.json"
         state_path.write_text("{bad json", encoding="utf-8")
         log = self.logs / "rebase-resolve-pr77-r1.log"
@@ -674,7 +691,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertTrue(action["status_only"])
         self.assertNotIn("controller_action", action)
         self.assertIn("pr=77", action["diagnostic"])
-        self.assertIn("head_ref=refactor/iter77-stale", action["diagnostic"])
+        self.assertIn("head_ref=refactor/2026-07-15_issue-77", action["diagnostic"])
         self.assertIn("state_path=.refactor-loop/state/rebase-resolve-false-done-recovery.json", action["diagnostic"])
         self.assertIn("log_path=.refactor-loop/logs/rebase-resolve-pr77-r1.log.false-done", action["diagnostic"])
         self.assertTrue((self.logs / "rebase-resolve-pr77-r1.log.false-done").exists())
@@ -686,12 +703,12 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             number=77,
             title="stale",
             labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING),
-            head_ref="refactor/iter77-stale",
+            head_ref="refactor/2026-07-15_issue-77",
             head_sha="abc123",
         )
         worktree = self.repo / ".worktrees" / "iter77-stale"
         worktree.mkdir(parents=True)
-        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/iter77-stale\n"
+        porcelain = f"worktree {worktree}\nbranch refs/heads/refactor/2026-07-15_issue-77\n"
         log = self.logs / "rebase-resolve-pr77-r1.log"
         log.write_text("resolved\nREBASE_RESOLVE_DONE:77:ok\nEXIT=0\n", encoding="utf-8")
 
@@ -713,7 +730,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertTrue(action["status_only"])
         self.assertNotIn("controller_action", action)
         self.assertIn("pr=77", action["diagnostic"])
-        self.assertIn("head_ref=refactor/iter77-stale", action["diagnostic"])
+        self.assertIn("head_ref=refactor/2026-07-15_issue-77", action["diagnostic"])
         self.assertIn("log_path=.refactor-loop/logs/rebase-resolve-pr77-r1.log", action["diagnostic"])
         self.assertIn("archive_path=.refactor-loop/logs/rebase-resolve-pr77-r1.log.false-done", action["diagnostic"])
         self.assertTrue(log.exists())
@@ -1171,7 +1188,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                       ;;
                     stale_base_conflicting_pr|stale_base_branch_current|stale_base_done_clean|stale_base_done_resolved_merge|stale_base_done_unmerged|stale_base_done_dirty_status)
                       if [[ "$label" == "crnd:lifecycle:managed" ]]; then
-                        printf '[{"number":177,"title":"stale-base PR","headRefName":"refactor/iter177-stale","labels":[{"name":"crnd:lifecycle:managed"},{"name":"crnd:phase:reviewing"},{"name":"crnd:human:auto"}]}]\n'
+                        printf '[{"number":177,"title":"stale-base PR","headRefName":"refactor/2026-07-15_issue-177","labels":[{"name":"crnd:lifecycle:managed"},{"name":"crnd:phase:reviewing"},{"name":"crnd:human:auto"}]}]\n'
                       else
                         printf '[]\n'
                       fi
@@ -1192,14 +1209,14 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                       ;;
                     closing_pr_issue20)
                       if [[ "$label" == "crnd:lifecycle:managed" ]]; then
-                        printf '[{"number":320,"title":"closing PR","headRefName":"refactor/iter20-issue-20","body":"Closes #20","labels":[{"name":"crnd:lifecycle:managed"},{"name":"crnd:phase:reviewing"},{"name":"crnd:human:auto"}]}]\n'
+                        printf '[{"number":320,"title":"closing PR","headRefName":"refactor/2026-07-15_issue-20","body":"Closes #20","labels":[{"name":"crnd:lifecycle:managed"},{"name":"crnd:phase:reviewing"},{"name":"crnd:human:auto"}]}]\n'
                       else
                         printf '[]\n'
                       fi
                       ;;
-                    early_pr_issue20|local_iter_branch_issue20|local_iter_branch_issue20_stale_base)
+                    early_pr_issue20|local_iter_branch_issue20|local_iter_branch_issue20_stale_base|local_iter_branch_issue20_committed_no_pr)
                       if [[ "$label" == "crnd:lifecycle:managed" ]]; then
-                        printf '[{"number":320,"title":"early PR","headRefName":"refactor/iter20-issue-20","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"Closes #20","labels":[{"name":"crnd:lifecycle:managed"},{"name":"crnd:phase:reviewing"},{"name":"crnd:human:auto"}]}]\n'
+                        printf '[{"number":320,"title":"legacy implementation PR","headRefName":"refactor/iter20-issue-20","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","body":"Closes #20","labels":[{"name":"crnd:lifecycle:managed"},{"name":"crnd:phase:reviewing"},{"name":"crnd:human:auto"}]}]\n'
                       else
                         printf '[]\n'
                       fi
@@ -1561,6 +1578,9 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "local_iter_branch_issue20": [
                 pr(320, "closing PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter20-issue-20", body="Closes #20"),
             ],
+            "local_iter_branch_issue20_committed_no_pr": [
+                pr(320, "legacy implementation PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter20-issue-20", body="Closes #20"),
+            ],
             "managed_canonical": [
                 pr(91, "canonical PR", [managed, reviewing, auto], head_ref="impl/canonical"),
                 pr(92, "second canonical PR", [managed, label_catalog.PHASE_DESIGN_SOLVING, auto], head_ref="impl/second"),
@@ -1577,22 +1597,22 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "ci_red_issue20": [pr(31, "red PR", [managed, ci_running, auto], head_sha="ci-red-sha")],
             "open_pr_123": [pr(123, "open PR target", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="impl/pr123")],
             "stale_base_conflicting_pr": [
-                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter177-stale")
+                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-177")
             ],
             "stale_base_done_clean": [
-                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter177-stale")
+                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-177")
             ],
             "stale_base_done_resolved_merge": [
-                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter177-stale")
+                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-177")
             ],
             "stale_base_done_unmerged": [
-                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter177-stale")
+                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-177")
             ],
             "stale_base_done_dirty_status": [
-                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter177-stale")
+                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-177")
             ],
             "stale_base_branch_current": [
-                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter177-stale")
+                pr(177, "stale-base PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-177")
             ],
             "open_pr_480": [
                 pr(480, "wedged review PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="impl/pr480", head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
@@ -1615,10 +1635,10 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "review_thread_node_malformed": [pr(77, "open PR target", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="impl/pr77")],
             "closing_pr_issue20": [
                 issue(20, "open target", [managed, label_catalog.PHASE_IMPLEMENTING, auto]),
-                pr(320, "closing PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter20-issue-20", body="Closes #20"),
+                pr(320, "closing PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-20", body="Closes #20"),
             ],
             "resume_requested_issue20_with_closing_pr": [
-                pr(320, "closing PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/iter20-issue-20", body="Closes #20"),
+                pr(320, "closing PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="refactor/2026-07-15_issue-20", body="Closes #20"),
             ],
             "represented_parent": [pr(255, "child PR", [managed, label_catalog.PHASE_REVIEWING, auto], head_ref="impl/issue239", body="Closes #239")],
             "open_issue_453_with_closing_pr": [
@@ -1722,15 +1742,15 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                     exit 0
                   fi
                   if [[ "$fixture" == "local_iter_branch_issue20" || "$fixture" == "local_iter_branch_issue20_stale_base" || "$fixture" == "local_iter_branch_issue20_noop" || "$fixture" == "local_iter_branch_issue20_committed_no_pr" || "$fixture" == "local_iter_branch_issue20_missing_pr" ]]; then
-                    printf 'worktree %s/.worktrees/iter20-issue-20\nbranch refs/heads/refactor/iter20-issue-20\n\n' "$WAKEUP_PLAN_REPO_ROOT"
+                    printf 'worktree %s/.worktrees/refactor__2026-07-15_issue-20\nbranch refs/heads/refactor/2026-07-15_issue-20\n\n' "$WAKEUP_PLAN_REPO_ROOT"
                     exit 0
                   fi
                   if [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]]; then
-                    printf 'worktree %s/.worktrees/iter581-issue-581\nbranch refs/heads/refactor/iter581-issue-581\n\n' "$WAKEUP_PLAN_REPO_ROOT"
+                    printf 'worktree %s/.worktrees/refactor__2026-07-15_issue-581\nbranch refs/heads/refactor/2026-07-15_issue-581\n\n' "$WAKEUP_PLAN_REPO_ROOT"
                     exit 0
                   fi
                   if [[ "$fixture" == "stale_base_done_clean" || "$fixture" == "stale_base_done_resolved_merge" || "$fixture" == "stale_base_done_unmerged" || "$fixture" == "stale_base_done_dirty_status" ]]; then
-                    printf 'worktree %s/.worktrees/iter177-stale\nbranch refs/heads/refactor/iter177-stale\n\n' "$WAKEUP_PLAN_REPO_ROOT"
+                    printf 'worktree %s/.worktrees/iter177-stale\nbranch refs/heads/refactor/2026-07-15_issue-177\n\n' "$WAKEUP_PLAN_REPO_ROOT"
                     exit 0
                   fi
                   printf 'worktree %s/.worktrees/pr77\nbranch refs/heads/refactor/iter77-worker\n\n' "$WAKEUP_PLAN_REPO_ROOT"
@@ -1745,23 +1765,23 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                   printf 'remote-sha\n'
                   exit 0
                 fi
-                if [[ "$*" == *"rev-parse --verify refs/heads/refactor/iter20-issue-20"* ]]; then
+                if [[ "$*" == *"rev-parse --verify refs/heads/refactor/2026-07-15_issue-20"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue20" || "$fixture" == "local_iter_branch_issue20_stale_base" || "$fixture" == "local_iter_branch_issue20_noop" || "$fixture" == "local_iter_branch_issue20_committed_no_pr" || "$fixture" == "local_iter_branch_issue20_missing_pr" ]] && printf 'local-iter-sha\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *"rev-parse --verify refs/heads/refactor/iter581-issue-581"* ]]; then
+                if [[ "$*" == *"rev-parse --verify refs/heads/refactor/2026-07-15_issue-581"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf 'local-iter-sha\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *"rev-parse --verify refs/remotes/origin/refactor/iter20-issue-20"* ]]; then
+                if [[ "$*" == *"rev-parse --verify refs/remotes/origin/refactor/2026-07-15_issue-20"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue20" || "$fixture" == "local_iter_branch_issue20_stale_base" || "$fixture" == "local_iter_branch_issue20_noop" || "$fixture" == "local_iter_branch_issue20_committed_no_pr" || "$fixture" == "local_iter_branch_issue20_missing_pr" || "$fixture" == "remote_iter_branch_issue20" ]] && printf 'remote-iter-sha\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *"rev-parse --verify refs/remotes/origin/refactor/iter581-issue-581"* ]]; then
+                if [[ "$*" == *"rev-parse --verify refs/remotes/origin/refactor/2026-07-15_issue-581"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf 'remote-iter-sha\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *"rev-parse --verify origin/refactor/iter177-stale"* ]]; then
+                if [[ "$*" == *"rev-parse --verify origin/refactor/2026-07-15_issue-177"* ]]; then
                   [[ "$fixture" == "stale_base_conflicting_pr" || "$fixture" == "stale_base_branch_current" || "$fixture" == "stale_base_done_clean" || "$fixture" == "stale_base_done_resolved_merge" || "$fixture" == "stale_base_done_unmerged" || "$fixture" == "stale_base_done_dirty_status" ]] && printf 'stale-head-sha\n' && exit 0
                   exit 1
                 fi
@@ -1771,7 +1791,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                     exit 0
                   fi
                 fi
-                if [[ "$*" == *"merge-base origin/refactor/iter177-stale origin/auto-refact-dev"* ]]; then
+                if [[ "$*" == *"merge-base origin/refactor/2026-07-15_issue-177 origin/auto-refact-dev"* ]]; then
                   if [[ "$fixture" == "stale_base_conflicting_pr" || "$fixture" == "stale_base_done_clean" || "$fixture" == "stale_base_done_resolved_merge" || "$fixture" == "stale_base_done_unmerged" || "$fixture" == "stale_base_done_dirty_status" ]]; then
                     printf 'old-base-sha\n'
                     exit 0
@@ -1806,19 +1826,19 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 if [[ "$*" == *"rev-parse --verify refs/remotes/origin/refactor/iter"* ]]; then
                   exit 1
                 fi
-                if [[ "$*" == *".worktrees/iter20-issue-20"* && "$*" == *"rev-parse --abbrev-ref HEAD"* ]]; then
-                  [[ "$fixture" == "local_iter_branch_issue20" ]] && printf 'refactor/iter20-issue-20\n' && exit 0
-                  [[ "$fixture" == "local_iter_branch_issue20_stale_base" ]] && printf 'refactor/iter20-issue-20\n' && exit 0
-                  [[ "$fixture" == "local_iter_branch_issue20_noop" ]] && printf 'refactor/iter20-issue-20\n' && exit 0
-                  [[ "$fixture" == "local_iter_branch_issue20_committed_no_pr" ]] && printf 'refactor/iter20-issue-20\n' && exit 0
-                  [[ "$fixture" == "local_iter_branch_issue20_missing_pr" ]] && printf 'refactor/iter20-issue-20\n' && exit 0
+                if [[ "$*" == *".worktrees/refactor__2026-07-15_issue-20"* && "$*" == *"rev-parse --abbrev-ref HEAD"* ]]; then
+                  [[ "$fixture" == "local_iter_branch_issue20" ]] && printf 'refactor/2026-07-15_issue-20\n' && exit 0
+                  [[ "$fixture" == "local_iter_branch_issue20_stale_base" ]] && printf 'refactor/2026-07-15_issue-20\n' && exit 0
+                  [[ "$fixture" == "local_iter_branch_issue20_noop" ]] && printf 'refactor/2026-07-15_issue-20\n' && exit 0
+                  [[ "$fixture" == "local_iter_branch_issue20_committed_no_pr" ]] && printf 'refactor/2026-07-15_issue-20\n' && exit 0
+                  [[ "$fixture" == "local_iter_branch_issue20_missing_pr" ]] && printf 'refactor/2026-07-15_issue-20\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *".worktrees/iter581-issue-581"* && "$*" == *"rev-parse --abbrev-ref HEAD"* ]]; then
-                  [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf 'refactor/iter581-issue-581\n' && exit 0
+                if [[ "$*" == *".worktrees/refactor__2026-07-15_issue-581"* && "$*" == *"rev-parse --abbrev-ref HEAD"* ]]; then
+                  [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf 'refactor/2026-07-15_issue-581\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *".worktrees/iter20-issue-20"* && "$*" == *"merge-base HEAD origin/auto-refact-dev"* ]]; then
+                if [[ "$*" == *".worktrees/refactor__2026-07-15_issue-20"* && "$*" == *"merge-base HEAD origin/auto-refact-dev"* ]]; then
                   if [[ "$fixture" == "local_iter_branch_issue20_stale_base" ]]; then
                     printf 'old-base\n'
                     exit 0
@@ -1826,11 +1846,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                   [[ "$fixture" == "local_iter_branch_issue20" || "$fixture" == "local_iter_branch_issue20_noop" || "$fixture" == "local_iter_branch_issue20_committed_no_pr" || "$fixture" == "local_iter_branch_issue20_missing_pr" ]] && printf 'fresh-base\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *".worktrees/iter581-issue-581"* && "$*" == *"merge-base HEAD origin/auto-refact-dev"* ]]; then
+                if [[ "$*" == *".worktrees/refactor__2026-07-15_issue-581"* && "$*" == *"merge-base HEAD origin/auto-refact-dev"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf 'old-base\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *".worktrees/iter20-issue-20"* && "$*" == *"rev-parse --verify origin/auto-refact-dev"* ]]; then
+                if [[ "$*" == *".worktrees/refactor__2026-07-15_issue-20"* && "$*" == *"rev-parse --verify origin/auto-refact-dev"* ]]; then
                   if [[ "$fixture" == "local_iter_branch_issue20_stale_base" ]]; then
                     printf 'new-base\n'
                     exit 0
@@ -1838,7 +1858,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                   [[ "$fixture" == "local_iter_branch_issue20" || "$fixture" == "local_iter_branch_issue20_noop" || "$fixture" == "local_iter_branch_issue20_committed_no_pr" || "$fixture" == "local_iter_branch_issue20_missing_pr" ]] && printf 'fresh-base\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *".worktrees/iter581-issue-581"* && "$*" == *"rev-parse --verify origin/auto-refact-dev"* ]]; then
+                if [[ "$*" == *".worktrees/refactor__2026-07-15_issue-581"* && "$*" == *"rev-parse --verify origin/auto-refact-dev"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf 'new-base\n' && exit 0
                   exit 1
                 fi
@@ -1850,11 +1870,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                   fi
                   exit 0
                 fi
-                if [[ "$*" == *"rev-list --count refs/remotes/origin/refactor/iter20-issue-20..HEAD"* ]]; then
+                if [[ "$*" == *"rev-list --count refs/remotes/origin/refactor/2026-07-15_issue-20..HEAD"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue20" || "$fixture" == "local_iter_branch_issue20_stale_base" || "$fixture" == "local_iter_branch_issue20_noop" || "$fixture" == "local_iter_branch_issue20_committed_no_pr" || "$fixture" == "local_iter_branch_issue20_missing_pr" ]] && printf '2\n' && exit 0
                   exit 1
                 fi
-                if [[ "$*" == *"rev-list --count refs/remotes/origin/refactor/iter581-issue-581..HEAD"* ]]; then
+                if [[ "$*" == *"rev-list --count refs/remotes/origin/refactor/2026-07-15_issue-581..HEAD"* ]]; then
                   [[ "$fixture" == "local_iter_branch_issue581_stale_base_noop" ]] && printf '0\n' && exit 0
                   exit 1
                 fi
@@ -2599,7 +2619,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n",
             encoding="utf-8",
         )
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts(issue=20, cluster="issue-20")
 
         plan = self.run_plan(fixture="local_iter_branch_issue20", ps_count=0)
@@ -3598,23 +3618,20 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertNotIn("no_generic_command", action)
 
     def test_safe_head_ref_rejects_colon_refs(self) -> None:
-        self.assertIsNone(safe_head_ref("refactor/iter20-issue-20:partial"))
-        self.assertEqual("refactor/iter20-issue-20", safe_head_ref("refactor/iter20-issue-20"))
+        self.assertIsNone(safe_head_ref("refactor/2026-07-15_issue-20:partial"))
+        self.assertEqual("refactor/2026-07-15_issue-20", safe_head_ref("refactor/2026-07-15_issue-20"))
 
     def test_implementation_head_ref_strips_terminal_result_statuses(self) -> None:
         for status in ("ok", "partial", "blocked"):
             with self.subTest(status=status):
                 action = {"source_marker": f"IMPLEMENT_DONE:issue-20:{status}"}
-                self.assertEqual(
-                    "refactor/iter20-issue-20",
-                    _implementation_head_ref(action, ("issue", 20)),
-                )
+                self.assertIsNone(_implementation_head_ref(action, ("issue", 20)))
 
     def test_stale_publish_partial_and_blocked_markers_find_canonical_worktree(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
         open_targets = {("issue", 20)}
-        worktrees = {"refactor/iter20-issue-20": worktree}
+        worktrees = {"refactor/2026-07-15_issue-20": worktree}
 
         for status in ("partial", "blocked"):
             with self.subTest(status=status):
@@ -3638,12 +3655,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                         [],
                     )
 
-                self.assertNotEqual("implementation_worktree_missing", reason)
-                self.assertEqual("refactor/iter20-issue-20", action["head_ref"])
-                self.assertEqual(str(worktree), action["worktree"])
+                self.assertEqual("implementation_head_ref_missing", reason)
+                self.assertEqual("", action["head_ref"])
 
     def test_publish_implementation_marker_with_verified_local_head_remains_executable(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue20.log").write_text(
             "IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n",
@@ -3655,8 +3671,8 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         action = next(item for item in plan["actions"] if item["action_id"].startswith("completed-marker:implement-issue20"))
         self.assertEqual(action["controller_action"], "publish_implementation_output")
         self.assertNotIn("status_only", action)
-        self.assertEqual(action["head_ref"], "refactor/iter20-issue-20")
-        self.assertEqual(Path(action["worktree"]).resolve(), (self.repo / ".worktrees/iter20-issue-20").resolve())
+        self.assertEqual(action["head_ref"], "refactor/2026-07-15_issue-20")
+        self.assertEqual(Path(action["worktree"]).resolve(), (self.repo / ".worktrees/refactor__2026-07-15_issue-20").resolve())
         self.assertEqual(action["runner_authority"], "wakeup-runner-396")
         self.assertEqual(action["title_file"], ".refactor-loop/runs/implementation-pr-issue-20-title.txt")
         self.assertEqual(action["body_file"], ".refactor-loop/runs/implementation-pr-issue-20-body.md")
@@ -3664,11 +3680,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertIn("fresh_integration_base", action["preconditions"])
         self.assertIn("worker_authored_pr_artifacts", action["preconditions"])
         self.assertIn("no_conflicting_open_implementation_pr", action["preconditions"])
-        self.assertEqual(action["target_pr_number"], 320)
+        self.assertEqual(action["legacy_pr_number"], 320)
         self.assertNotIn("verified_pr_head", action["preconditions"])
 
     def test_publish_ready_implementation_does_not_count_expected_worker(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue20.log").write_text(
             "IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n",
@@ -3693,7 +3709,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertNotIn("HARD_GATE:dispatch_required=", stdout)
 
     def test_publish_implementation_marker_without_matching_pr_remains_executable(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue20.log").write_text(
             "IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n",
@@ -3704,14 +3720,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
 
         action = next(item for item in plan["actions"] if item["action_id"].startswith("completed-marker:implement-issue20"))
         self.assertEqual(action["controller_action"], "publish_implementation_output")
-        self.assertNotIn("status_only", action)
-        self.assertEqual(action["runner_authority"], "wakeup-runner-396")
-        self.assertIn("no_conflicting_open_implementation_pr", action["preconditions"])
-        self.assertNotIn("target_pr_number", action)
-        self.assertNotIn("suppressed_reason", action)
+        self.assertTrue(action["status_only"])
+        self.assertEqual(action["suppressed_reason"], "legacy_implementation_pr_evidence_missing_or_ambiguous")
 
     def test_noop_implementation_done_empty_scoped_diff_is_status_only_not_hard_gate(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         log = self.logs / "implement-issue20.log"
         log.write_text(
@@ -3741,7 +3754,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertEqual(plan["hard_gate"]["dispatch_required"], 0)
 
     def test_noop_implementation_done_empty_scoped_diff_does_not_count_expected_worker(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         log = self.logs / "implement-issue20.log"
         log.write_text(
@@ -3761,7 +3774,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertNotIn("HARD_GATE:dispatch_required=", stdout)
 
     def test_zero_code_noop_implementation_done_projects_close_helper_and_not_expected_worker(self) -> None:
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-581").mkdir(parents=True)
         _title, body = self.write_implementation_pr_artifacts(issue=581, cluster="issue-581")
         body.write_text(
             "## Changed files\n\n- 0 LOC no source changes\n\n"
@@ -3823,7 +3836,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertNotIn("HARD_GATE:dispatch_required=", stdout)
 
     def test_noop_implementation_without_zero_code_proof_stays_status_only(self) -> None:
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-581").mkdir(parents=True)
         self.write_implementation_pr_artifacts(issue=581, cluster="issue-581")
         log = self.logs / "implement-issue-581.log"
         log.write_text(
@@ -3841,7 +3854,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertNotIn("no_generic_command", action)
 
     def test_stale_spawn_intent_for_noop_implementation_does_not_reopen_hard_gate(self) -> None:
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-581").mkdir(parents=True)
         self.write_implementation_pr_artifacts(issue=581, cluster="issue-581")
         log = self.logs / "implement-issue-581.log"
         log.write_text(
@@ -3873,7 +3886,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
     def test_monitor_fallback_suppresses_empty_scoped_diff_expected_worker(self) -> None:
         from codex_refactor_loop.wakeup_plan import canonical_expected_from_active_tasks
 
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-581").mkdir(parents=True)
         self.write_implementation_pr_artifacts(issue=581, cluster="issue-581")
         (self.logs / "implement-issue-581.log").write_text(
             "no code change required\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n",
@@ -3914,7 +3927,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertEqual(breakdown, [])
 
     def test_artifact_backed_completed_implementation_supersedes_stale_spawn_intent(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue-20.log").write_text(
             "summary\n⟦AI:AUTO-LOOP⟧\nIMPLEMENT_DONE:issue-20:ok\n"
@@ -3940,10 +3953,10 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             and action.get("target_kind") == "issue"
             and action.get("target_number") == 20
         )
-        self.assertFalse(publish.get("status_only"))
+        self.assertFalse(publish.get("status_only"), publish)
         self.assertEqual(publish["source_marker"], "IMPLEMENT_DONE:issue-20:ok")
-        self.assertEqual(publish["head_ref"], "refactor/iter20-issue-20")
-        self.assertEqual(Path(publish["worktree"]).resolve(), (self.repo / ".worktrees/iter20-issue-20").resolve())
+        self.assertEqual(publish["head_ref"], "refactor/2026-07-15_issue-20")
+        self.assertEqual(Path(publish["worktree"]).resolve(), (self.repo / ".worktrees/refactor__2026-07-15_issue-20").resolve())
         stale_spawn = next(
             action
             for action in plan["actions"]
@@ -3964,7 +3977,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         )
 
     def test_publish_implementation_marker_without_pr_artifacts_is_status_only(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         (self.logs / "implement-issue20.log").write_text(
             "IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n",
             encoding="utf-8",
@@ -3978,7 +3991,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertNotIn("runner_authority", action)
 
     def test_missing_implementation_pr_artifacts_project_bounded_repair_worker(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         (self.logs / "implement-issue20.log").write_text(
             "IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n",
             encoding="utf-8",
@@ -4007,8 +4020,8 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertEqual(repair["title_file"], ".refactor-loop/runs/implementation-pr-issue-20-title.txt")
         self.assertEqual(repair["body_file"], ".refactor-loop/runs/implementation-pr-issue-20-body.md")
         self.assertEqual(repair["implementation_summary"], ".refactor-loop/runs/implement-issue20.md")
-        self.assertEqual(Path(repair["worktree"]).resolve(), (self.repo / ".worktrees/iter20-issue-20").resolve())
-        self.assertEqual(repair["head_ref"], "refactor/iter20-issue-20")
+        self.assertEqual(Path(repair["worktree"]).resolve(), (self.repo / ".worktrees/refactor__2026-07-15_issue-20").resolve())
+        self.assertEqual(repair["head_ref"], "refactor/2026-07-15_issue-20")
         self.assertIn("implementation_pr_artifacts_missing_or_invalid", repair["preconditions"])
         self.assertEqual(repair["runner_authority"], "wakeup-runner-396")
         self.assertTrue(repair["no_generic_command"])
@@ -4016,7 +4029,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             self.assertNotIn(forbidden, repair)
 
     def test_publish_implementation_marker_with_malformed_pr_artifacts_is_status_only(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
         title, body = self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue20.log").write_text(
@@ -4048,7 +4061,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 self.assertNotIn("runner_authority", action)
 
     def test_publish_implementation_projection_suppresses_outside_pr_artifact_path(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
         title, body = self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue20.log").write_text(
@@ -4065,12 +4078,12 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "target_number": 20,
             "source_artifact": ".refactor-loop/logs/implement-issue20.log",
             "source_marker": "IMPLEMENT_DONE:issue-20:ok",
-            "head_ref": "refactor/iter20-issue-20",
+            "head_ref": "refactor/2026-07-15_issue-20",
             "title_file": str(outside),
             "body_file": body.relative_to(self.repo).as_posix(),
         }
 
-        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/iter20-issue-20": worktree}):
+        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/2026-07-15_issue-20": worktree}):
             with mock.patch("codex_refactor_loop.wakeup_plan.classify_implement_attempt", return_value=mock.Mock(redispatch=False, in_flight=False)):
                 suppress_stale_unexecutable_actions(
                     [action],
@@ -4090,7 +4103,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertEqual(action["suppressed_reason"], "implementation_pr_title_artifact_invalid_path")
 
     def test_publish_implementation_projection_suppresses_outside_pr_body_artifact_path(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
         title, body = self.write_implementation_pr_artifacts()
         (self.logs / "implement-issue20.log").write_text(
@@ -4107,12 +4120,12 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "target_number": 20,
             "source_artifact": ".refactor-loop/logs/implement-issue20.log",
             "source_marker": "IMPLEMENT_DONE:issue-20:ok",
-            "head_ref": "refactor/iter20-issue-20",
+            "head_ref": "refactor/2026-07-15_issue-20",
             "title_file": title.relative_to(self.repo).as_posix(),
             "body_file": str(outside),
         }
 
-        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/iter20-issue-20": worktree}):
+        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/2026-07-15_issue-20": worktree}):
             with mock.patch("codex_refactor_loop.wakeup_plan.classify_implement_attempt", return_value=mock.Mock(redispatch=False, in_flight=False)):
                 suppress_stale_unexecutable_actions(
                     [action],
@@ -4133,7 +4146,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
 
     def test_clean_implementation_marker_with_stale_base_stays_publishable_without_redispatch_churn(self) -> None:
         self.write_consensus_artifact()
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         log = self.logs / "implement-issue20.log"
         log.write_text("IMPLEMENT_DONE:issue-20:ok\nEXIT=0\n", encoding="utf-8")
@@ -4143,11 +4156,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         publish = next(item for item in plan["actions"] if str(item.get("action_id") or "").startswith("completed-marker:implement-issue20"))
         self.assertFalse(publish.get("status_only"))
         self.assertEqual(publish["controller_action"], "publish_implementation_output")
-        self.assertEqual(publish["head_ref"], "refactor/iter20-issue-20")
-        self.assertEqual(Path(publish["worktree"]).resolve(), (self.repo / ".worktrees/iter20-issue-20").resolve())
+        self.assertEqual(publish["head_ref"], "refactor/2026-07-15_issue-20")
+        self.assertEqual(Path(publish["worktree"]).resolve(), (self.repo / ".worktrees/refactor__2026-07-15_issue-20").resolve())
         self.assertEqual(publish["runner_authority"], "wakeup-runner-396")
         self.assertIn("no_conflicting_open_implementation_pr", publish["preconditions"])
-        self.assertEqual(publish["target_pr_number"], 320)
+        self.assertEqual(publish["legacy_pr_number"], 320)
         self.assertTrue(log.exists())
         self.assertFalse(
             any(
@@ -4159,8 +4172,9 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         )
 
     def test_current_matching_open_implementation_pr_suppresses_publish_action(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
+        self.write_implementation_pr_artifacts()
         action = {
             "kind": "completed-marker",
             "action_id": "completed-marker:implement-issue20.log:IMPLEMENT_DONE:issue-20:ok",
@@ -4169,7 +4183,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "target_number": 20,
             "source_artifact": ".refactor-loop/logs/implement-issue20.log",
             "source_marker": "IMPLEMENT_DONE:issue-20:ok",
-            "head_ref": "refactor/iter20-issue-20",
+            "head_ref": "refactor/2026-07-15_issue-20",
         }
         current_sha = "a" * 40
 
@@ -4180,7 +4194,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
             raise AssertionError(f"unexpected git call: {command}")
 
-        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/iter20-issue-20": worktree}):
+        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/2026-07-15_issue-20": worktree}):
             with mock.patch("codex_refactor_loop.wakeup_plan.classify_implement_attempt", return_value=mock.Mock(redispatch=False, in_flight=False)):
                 with mock.patch("codex_refactor_loop.wakeup_plan.git_text", side_effect=fake_git):
                     suppress_stale_unexecutable_actions(
@@ -4198,6 +4212,15 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                                 320,
                                 "closing PR",
                                 (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
+                                head_ref="refactor/2026-07-15_issue-20",
+                                head_sha=current_sha,
+                                body="Closes #20",
+                            ),
+                            GhItem(
+                                "PR",
+                                319,
+                                "legacy PR",
+                                (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
                                 head_ref="refactor/iter20-issue-20",
                                 head_sha=current_sha,
                                 body="Closes #20",
@@ -4206,14 +4229,12 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                         gh_items_loaded=True,
                     )
 
-        self.assertTrue(action["status_only"])
-        self.assertEqual("pr_already_open_current", action["suppressed_reason"])
+        self.assertFalse(action.get("status_only"))
         self.assertEqual(320, action["target_pr_number"])
-        self.assertTrue(action["no_lifecycle_authority"])
-        self.assertNotIn("runner_authority", action)
+        self.assertEqual(319, action["legacy_pr_number"])
 
     def test_current_matching_open_implementation_pr_requires_clean_worktree(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         action = {
@@ -4224,7 +4245,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "target_number": 20,
             "source_artifact": ".refactor-loop/logs/implement-issue20.log",
             "source_marker": "IMPLEMENT_DONE:issue-20:ok",
-            "head_ref": "refactor/iter20-issue-20",
+            "head_ref": "refactor/2026-07-15_issue-20",
         }
         current_sha = "a" * 40
 
@@ -4235,7 +4256,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout=" M skills/consensus-loop/SKILL.md\n", stderr="")
             raise AssertionError(f"unexpected git call: {command}")
 
-        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/iter20-issue-20": worktree}):
+        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/2026-07-15_issue-20": worktree}):
             with mock.patch("codex_refactor_loop.wakeup_plan.classify_implement_attempt", return_value=mock.Mock(redispatch=False, in_flight=False)):
                 with mock.patch("codex_refactor_loop.wakeup_plan.git_text", side_effect=fake_git):
                     suppress_stale_unexecutable_actions(
@@ -4252,6 +4273,15 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                                 "PR",
                                 320,
                                 "closing PR",
+                                (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
+                                head_ref="refactor/2026-07-15_issue-20",
+                                head_sha=current_sha,
+                                body="Closes #20",
+                            ),
+                            GhItem(
+                                "PR",
+                                319,
+                                "legacy PR",
                                 (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
                                 head_ref="refactor/iter20-issue-20",
                                 head_sha=current_sha,
@@ -4266,8 +4296,9 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertIn("clean_scoped_diff", action["preconditions"])
 
     def test_current_matching_open_implementation_pr_allows_one_remote_visibility_retry(self) -> None:
-        worktree = self.repo / ".worktrees" / "iter20-issue-20"
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-20"
         worktree.mkdir(parents=True)
+        self.write_implementation_pr_artifacts()
         action = {
             "kind": "completed-marker",
             "action_id": "completed-marker:implement-issue20.log:IMPLEMENT_DONE:issue-20:ok",
@@ -4276,7 +4307,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "target_number": 20,
             "source_artifact": ".refactor-loop/logs/implement-issue20.log",
             "source_marker": "IMPLEMENT_DONE:issue-20:ok",
-            "head_ref": "refactor/iter20-issue-20",
+            "head_ref": "refactor/2026-07-15_issue-20",
         }
         current_sha = "b" * 40
         stale_sha = "c" * 40
@@ -4288,11 +4319,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout=f"{current_sha}\n", stderr="")
             if command == ["git", "-C", str(worktree), "status", "--porcelain"]:
                 return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-            if command == ["git", "-C", str(worktree), "rev-parse", "--verify", "refs/remotes/origin/refactor/iter20-issue-20"]:
+            if command == ["git", "-C", str(worktree), "rev-parse", "--verify", "refs/remotes/origin/refactor/2026-07-15_issue-20"]:
                 return subprocess.CompletedProcess(command, 0, stdout=f"{current_sha}\n", stderr="")
             raise AssertionError(f"unexpected git call: {command}")
 
-        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/iter20-issue-20": worktree}):
+        with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/2026-07-15_issue-20": worktree}):
             with mock.patch("codex_refactor_loop.wakeup_plan.classify_implement_attempt", return_value=mock.Mock(redispatch=False, in_flight=False)):
                 with mock.patch("codex_refactor_loop.wakeup_plan.git_text", side_effect=fake_git):
                     suppress_stale_unexecutable_actions(
@@ -4310,21 +4341,29 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                                 320,
                                 "closing PR",
                                 (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
-                                head_ref="refactor/iter20-issue-20",
+                                head_ref="refactor/2026-07-15_issue-20",
                                 head_sha=stale_sha,
+                                body="Closes #20",
+                            ),
+                            GhItem(
+                                "PR",
+                                319,
+                                "legacy PR",
+                                (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
+                                head_ref="refactor/iter20-issue-20",
+                                head_sha=current_sha,
                                 body="Closes #20",
                             ),
                         ],
                         gh_items_loaded=True,
                     )
 
-        self.assertTrue(action["status_only"])
-        self.assertEqual("pr_already_open_current", action["suppressed_reason"])
+        self.assertFalse(action.get("status_only"))
         self.assertEqual(
             [
                 ["git", "-C", str(worktree), "rev-parse", "HEAD"],
                 ["git", "-C", str(worktree), "status", "--porcelain"],
-                ["git", "-C", str(worktree), "rev-parse", "--verify", "refs/remotes/origin/refactor/iter20-issue-20"],
+                ["git", "-C", str(worktree), "rev-parse", "--verify", "refs/remotes/origin/refactor/2026-07-15_issue-20"],
             ],
             git_calls,
         )
@@ -4336,7 +4375,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         )
         for name, snapshot_sha, remote_sha, local_sha in cases:
             with self.subTest(name=name):
-                worktree = self.repo / ".worktrees" / f"iter20-issue-20-{name}"
+                worktree = self.repo / ".worktrees" / f"refactor__2026-07-15_issue-20-{name}"
                 worktree.mkdir(parents=True)
                 self.write_implementation_pr_artifacts()
                 action = {
@@ -4347,7 +4386,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                     "target_number": 20,
                     "source_artifact": f".refactor-loop/logs/implement-issue20-{name}.log",
                     "source_marker": "IMPLEMENT_DONE:issue-20:ok",
-                    "head_ref": "refactor/iter20-issue-20",
+                    "head_ref": "refactor/2026-07-15_issue-20",
                 }
 
                 def fake_git(command: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -4355,13 +4394,13 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                         return subprocess.CompletedProcess(command, 0, stdout=f"{local_sha}\n", stderr="")
                     if command == ["git", "-C", str(worktree), "status", "--porcelain"]:
                         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
-                    if command == ["git", "-C", str(worktree), "rev-parse", "--verify", "refs/remotes/origin/refactor/iter20-issue-20"]:
+                    if command == ["git", "-C", str(worktree), "rev-parse", "--verify", "refs/remotes/origin/refactor/2026-07-15_issue-20"]:
                         if remote_sha is None:
                             raise AssertionError("unknown PR head must not probe remote ref")
                         return subprocess.CompletedProcess(command, 0, stdout=f"{remote_sha}\n", stderr="")
                     raise AssertionError(f"unexpected git call: {command}")
 
-                with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/iter20-issue-20": worktree}):
+                with mock.patch("codex_refactor_loop.wakeup_plan._worktrees_by_branch", return_value={"refactor/2026-07-15_issue-20": worktree}):
                     with mock.patch("codex_refactor_loop.wakeup_plan.classify_implement_attempt", return_value=mock.Mock(redispatch=False, in_flight=False)):
                         with mock.patch("codex_refactor_loop.wakeup_plan.git_text", side_effect=fake_git):
                             suppress_stale_unexecutable_actions(
@@ -4379,8 +4418,17 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                                         320,
                                         "closing PR",
                                         (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
-                                        head_ref="refactor/iter20-issue-20",
+                                        head_ref="refactor/2026-07-15_issue-20",
                                         head_sha=snapshot_sha,
+                                        body="Closes #20",
+                                    ),
+                                    GhItem(
+                                        "PR",
+                                        319,
+                                        "legacy PR",
+                                        (label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
+                                        head_ref="refactor/iter20-issue-20",
+                                        head_sha=local_sha,
                                         body="Closes #20",
                                     ),
                                 ],
@@ -4392,7 +4440,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 self.assertIn("clean_scoped_diff", action["preconditions"])
 
     def test_committed_implementation_after_create_pull_request_rate_limit_stays_publishable(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         log = self.logs / "implement-issue20.log"
         marker = "IMPLEMENT_DONE:issue-20:ok"
@@ -4420,14 +4468,14 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         publish = next(item for item in plan["actions"] if str(item.get("action_id") or "").startswith("completed-marker:implement-issue20"))
         self.assertFalse(publish.get("status_only"))
         self.assertEqual(publish["controller_action"], "publish_implementation_output")
-        self.assertEqual(publish["head_ref"], "refactor/iter20-issue-20")
-        self.assertEqual(Path(publish["worktree"]).resolve(), (self.repo / ".worktrees/iter20-issue-20").resolve())
+        self.assertEqual(publish["head_ref"], "refactor/2026-07-15_issue-20")
+        self.assertEqual(Path(publish["worktree"]).resolve(), (self.repo / ".worktrees/refactor__2026-07-15_issue-20").resolve())
         self.assertEqual(publish["runner_authority"], "wakeup-runner-396")
         self.assertIn("clean_scoped_diff", publish["preconditions"])
         self.assertNotIn("suppressed_reason", publish)
 
     def test_nonretry_blocked_implementation_without_delta_stays_status_only(self) -> None:
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.write_implementation_pr_artifacts()
         log = self.logs / "implement-issue20.log"
         marker = "IMPLEMENT_DONE:issue-20:ok"
@@ -7016,13 +7064,13 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             item for item in plan["actions"]
             if item.get("controller_action") == "dispatch_consensus_implementation"
         )
-        self.assertTrue(action["status_only"])
-        self.assertEqual("remote_iter_branch", action["suppressed_reason"])
+        self.assertNotIn("status_only", action)
+        self.assertTrue(action["consensus_implementation_ready"])
 
     def test_consensus_implementation_readiness_redispatches_markerless_local_attempt(self) -> None:
         self.write_consensus_artifact()
         self.write_completed_log("phase9-issue20-r5-judge.log", "META_JUDGE_DONE:consensus:structural")
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         (self.logs / "implement-issue-20.log").write_text("old output\nEXIT=0\n", encoding="utf-8")
 
         plan = self.run_plan(fixture="open_issue_20")
@@ -7059,7 +7107,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "iteration": "20",
             "cluster_id": "issue-20",
         }
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.append_harness_spawn_intent(
             intent_id="dispatch-consensus-implementation:20",
             task_id="implement-issue-20",
@@ -7079,7 +7127,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "iteration": "20",
             "cluster_id": "issue-20",
         }
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         self.append_harness_spawn_intent(
             intent_id="dispatch-consensus-implementation:20",
             task_id="implement-issue-20",
@@ -7095,7 +7143,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.write_consensus_artifact()
         self.write_completed_log("phase9-issue20-r5-judge.log", "META_JUDGE_DONE:consensus:structural")
         self.write_completed_log("review-pr331-architect-r1.log", "REVIEW_DONE:331:architect:approve")
-        (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+        (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
         (self.repo / ".refactor-loop" / "prompts" / "implement-issue-20.md").parent.mkdir(parents=True, exist_ok=True)
         (self.repo / ".refactor-loop" / "prompts" / "implement-issue-20.md").write_text("implement\n", encoding="utf-8")
         tick_host_env = self.repo / ".config" / "consensus-rnd" / "tick-host.env"
@@ -7152,13 +7200,16 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.assertTrue(unrelated)
 
     def test_consensus_implementation_readiness_non_ok_marker_waits_on_pending_intent(self) -> None:
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-537"
+        worktree.mkdir(parents=True)
         action = {
             "target_kind": "issue",
             "target_number": 537,
             "iteration": "537",
             "cluster_id": "issue-537",
+            "head_ref": "refactor/2026-07-15_issue-537",
+            "worktree": str(worktree),
         }
-        (self.repo / ".worktrees" / "iter537-issue-537").mkdir(parents=True)
         self.append_harness_spawn_intent(
             intent_id="dispatch-consensus-implementation:537",
             task_id="implement-issue-537",
@@ -7187,11 +7238,11 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 self.write_completed_log("phase9-issue20-r5-judge.log", "META_JUDGE_DONE:consensus:structural")
                 env_updates: dict[str, str] = {}
                 if name == "worktree":
-                    (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+                    (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
                 elif name == "log":
                     (self.logs / "implement-issue-20.log").write_text("", encoding="utf-8")
                 elif name == "pending":
-                    (self.repo / ".worktrees" / "iter20-issue-20").mkdir(parents=True)
+                    (self.repo / ".worktrees" / "refactor__2026-07-15_issue-20").mkdir(parents=True)
                     self.append_harness_spawn_intent(
                         intent_id="dispatch-consensus-implementation:20",
                         task_id="implement-issue-20",
@@ -7200,7 +7251,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                     )
                 elif name == "in-flight":
                     env_updates["WAKEUP_PLAN_PS_EXTRA"] = (
-                        f"python3 /skill/consensus-rnd-cli spawn-codex --cd {self.repo}/.worktrees/iter20-issue-20 "
+                        f"python3 /skill/consensus-rnd-cli spawn-codex --cd {self.repo}/.worktrees/refactor__2026-07-15_issue-20 "
                         f"--log {self.repo}/.refactor-loop/logs/implement-issue-20.log"
                     )
 
@@ -7303,7 +7354,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
                 number=320,
                 title="closing PR",
                 labels=(label_catalog.MANAGED, label_catalog.PHASE_REVIEWING, label_catalog.HUMAN_AUTO),
-                head_ref="refactor/iter20-issue-20",
+                head_ref="refactor/2026-07-15_issue-20",
                 body="Closes #20",
             ),
         ]
@@ -7362,7 +7413,10 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
         self.set_audit_fallback_enable("true")
         self.write_consensus_artifact(issue=330, round_no=1)
         self.write_completed_log("phase9-issue330-r1-judge.log", "META_JUDGE_DONE:consensus:structural")
-        (self.repo / ".worktrees" / "iter330-issue-330").mkdir(parents=True)
+        branch = "refactor/2026-07-15_issue-330"
+        worktree = self.repo / ".worktrees" / branch.replace("/", "__")
+        worktree.mkdir(parents=True)
+        _write_publication_topology(self.repo, 330)
         self.append_harness_spawn_intent(
             intent_id="dispatch-consensus-implementation:330",
             task_id="implement-issue-330",
@@ -7749,7 +7803,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
             "implementation_head_ref_missing",
             "no_conflicting_open_implementation_pr",
             "multiple_matching_open_pr",
-            "pr_already_open_current",
+            "legacy_implementation_pr_evidence_missing_or_ambiguous",
             "status_only",
         ):
             with self.subTest(token=token):
@@ -8768,7 +8822,7 @@ class WakeupPlanBehaviorTests(unittest.TestCase):
 
         suppressed = next(action for action in plan["actions"] if action["action_id"].startswith("completed-marker:implement-issue507"))
         self.assertTrue(suppressed["status_only"])
-        self.assertEqual(suppressed["suppressed_reason"], "implementation_worktree_missing")
+        self.assertEqual(suppressed["suppressed_reason"], "implementation_head_ref_missing")
         self.assertNotIn("runner_authority", suppressed)
         reflector_actions = [action for action in plan["actions"] if action["kind"] == "repository-stalled-meta-reflector"]
         self.assertEqual(len(reflector_actions), 1)
@@ -9701,14 +9755,16 @@ class StaleRevivalTests(unittest.TestCase):
         self.assertTrue(log.exists())
 
     def test_clean_ok_stale_base_implement_log_is_not_revived_for_churn(self) -> None:
-        worktree = (self.repo / ".worktrees" / "iter421-issue-421").resolve()
+        branch = "refactor/2026-07-15_issue-421"
+        worktree = (self.repo / ".worktrees" / branch.replace("/", "__")).resolve()
         worktree.mkdir(parents=True)
+        _write_publication_topology(self.repo, 421)
         log = self.logs / "implement-issue-421.log"
         log.write_text("IMPLEMENT_DONE:issue-421:ok\nEXIT=0\n", encoding="utf-8")
 
         def fake_git(command: list[str], *, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
             if command == ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"]:
-                return subprocess.CompletedProcess(command, 0, "refactor/iter421-issue-421\n", "")
+                return subprocess.CompletedProcess(command, 0, branch + "\n", "")
             if command == ["git", "-C", str(worktree), "merge-base", "HEAD", "origin/auto-refact-dev"]:
                 return subprocess.CompletedProcess(command, 0, "old-base\n", "")
             if command == ["git", "-C", str(worktree), "rev-parse", "--verify", "origin/auto-refact-dev"]:

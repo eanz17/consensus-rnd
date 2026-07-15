@@ -17,6 +17,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from codex_refactor_loop.context import LoopContext
 from codex_refactor_loop.cross_instance_stand_down import CrossInstanceAdmission
 from codex_refactor_loop.github_actor import GitHubActorAdmission
+from codex_refactor_loop.controller_topology_authority import (
+    RetireSupersededPRResult,
+    ReviewGateProjection,
+    TopologyPhase,
+)
 from codex_refactor_loop.wakeup_runner import ReviewEvidence, WakeupRunner
 
 
@@ -25,6 +30,7 @@ class FakeActions:
         self.merged: list[str] = []
         self.rendered: list[tuple[int, int]] = []
         self.github_actor = self
+        self.retired: list[tuple[int, int]] = []
 
     def require_admission(self, action: str) -> GitHubActorAdmission:
         return GitHubActorAdmission(login="controller-bot", repo_slug="owner/repo", permission="write")
@@ -33,8 +39,19 @@ class FakeActions:
         return CrossInstanceAdmission("allowed", "test-allowed")
 
     def merge_pr(self, pr: str, linked_issue: str = "") -> int:
+        if not self.retired:
+            raise AssertionError("replacement merge must follow retirement terminal")
         self.merged.append(pr)
         return 0
+
+    def _retire_superseded_pr(self, request):
+        self.retired.append((request.old_pr_number, request.replacement_pr_number))
+        return RetireSupersededPRResult(
+            request.old_pr_number, request.replacement_pr_number, TopologyPhase.OLD_PR_CLOSED, "comment"
+        )
+
+    def _topology_review_projection(self, pr_number: int, head_sha: str, decision: str):
+        return ReviewGateProjection(decision, pr_number, head_sha, "evidence-digest")
 
     def render_review_fix_prompt(self, pr_number: int, round_number: int):
         self.rendered.append((pr_number, round_number))
@@ -65,6 +82,8 @@ class WakeupRunnerReviewGateTests(unittest.TestCase):
         self.actions = FakeActions()
         self.supervisor = FakeSupervisor()
         self.github_comments: list[dict[str, object]] = []
+        self.supersession_body = self.repo / ".refactor-loop/runs/controller-topology-supersession-pr12.md"
+        self.supersession_body.write_text("<!-- crnd:controller-topology-supersession -->\nReplacement: #12\n", encoding="utf-8")
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -138,6 +157,10 @@ class WakeupRunnerReviewGateTests(unittest.TestCase):
             "target": {"kind": "PR", "number": 12},
             "controller_action": "review_gate",
             "no_generic_command": True,
+            "superseded_pr_number": 11,
+            "linked_issue": 2737,
+            "supersession_body": self.supersession_body.read_text(encoding="utf-8"),
+            "base_ref": "main",
         }
         action.update(overrides)
         return action

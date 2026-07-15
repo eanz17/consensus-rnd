@@ -30,8 +30,8 @@ class CrossInstanceAuthorityBoundaryTests(unittest.TestCase):
         self.assertIn("CrossInstanceAdmission", projection)
         self.assertIn("return None", controller[controller.index("def _require_item_write_admission_or_return") : controller.index("def _cross_instance_runner")])
         self.assertIn("PUSH_OWNERSHIP_BLOCKED", controller)
-        self.assertIn("local_admission_evidence_only_not_durable_claim", controller)
-        self.assertIn("branch_pr_author_mismatch", controller)
+        self.assertNotIn("_write_branch_provenance", controller)
+        self.assertIn("missing-topology-provenance", controller)
 
     def test_stand_down_admission_writes_no_claim_or_lease_artifact(self) -> None:
         tmp = Path(tempfile.mkdtemp(prefix="cross-instance-boundary-"))
@@ -79,44 +79,15 @@ class CrossInstanceAuthorityBoundaryTests(unittest.TestCase):
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
-    def test_branch_provenance_schema_is_local_evidence_not_owner_claim_or_lease(self) -> None:
-        tmp = Path(tempfile.mkdtemp(prefix="cross-instance-provenance-"))
-        try:
-            (tmp / ".config" / "consensus-rnd").mkdir(parents=True)
-            (tmp / ".config" / "consensus-rnd" / "host.env").write_text(
-                f'export REPO_ROOT="{tmp}"\nexport GH_REPO_SLUG="owner/repo"\n'
-                'export INTEGRATION_BRANCH="integration-branch"\n'
-                'export REVIEW_BASE_BRANCH="review-base"\n',
-                encoding="utf-8",
-            )
-            ctx = LoopContext.load(repo_root=tmp, env={"CONSENSUS_RND_HOST_ENV": ".config/consensus-rnd/host.env"})
-            actions = ControllerActions(ctx)
-            branch = "refactor/iter699-cross-instance"
+    def test_topology_provenance_is_not_a_cross_instance_owner_claim_or_lease(self) -> None:
+        source = (SCRIPT_DIR / "codex_refactor_loop" / "controller_topology_authority.py").read_text(encoding="utf-8")
+        payload_block = source[source.index("class TopologyProvenance") : source.index("class _TopologyPort")]
 
-            actions._write_branch_provenance(branch=branch, worktree=tmp, issue="699", base_sha="abc123")
-            payload = json.loads((ctx.paths.state / "branch-provenance" / "refactor__iter699-cross-instance.json").read_text(encoding="utf-8"))
-
-            self.assertEqual(
-                {
-                    "authority",
-                    "base_sha",
-                    "branch",
-                    "created_at",
-                    "github_login",
-                    "issue",
-                    "owner_device",
-                    "worktree",
-                },
-                set(payload),
-            )
-            self.assertEqual("local_admission_evidence_only_not_durable_claim", payload["authority"])
-            self.assertNotIn("claim", set(payload) - {"authority"})
-            for forbidden in ("lease", "lifecycle_authority", "takeover_permit", "per_work_owner", "owner_scope"):
-                with self.subTest(forbidden=forbidden):
-                    self.assertNotIn(forbidden, payload)
-                    self.assertNotIn(forbidden, json.dumps(payload, sort_keys=True))
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertIn("generation: int", payload_block)
+        self.assertIn("digest: str", payload_block)
+        for forbidden in ("owner_device", "github_login", "lifecycle_authority", "takeover_permit", "per_work_owner", "owner_scope"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, payload_block)
 
     def test_release_publication_surface_is_not_cross_instance_gated(self) -> None:
         controller = (SCRIPT_DIR / "codex_refactor_loop" / "controller_actions.py").read_text(encoding="utf-8")

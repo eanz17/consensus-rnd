@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import socket
 import shutil
 import subprocess
 import tempfile
@@ -45,6 +48,7 @@ class PublishVerificationTests(unittest.TestCase):
             "issue": "77",
             "action": "publish_implementation_output",
             "head_ref": "refactor/iter77-issue-77",
+            "base_branch": "canonical-integration",
             "candidate_sha": "a" * 40,
             "env": self.env,
         }
@@ -320,6 +324,7 @@ class PublishVerificationTests(unittest.TestCase):
         request = json.loads((result.job_dir / "request.json").read_text(encoding="utf-8"))
         running = {
             "schema": "PublishVerificationResult",
+            "version": publish_verification.VERIFY_VERSION,
             "status": "RUNNING",
             "reason": "running",
             "job_key": result.job_key,
@@ -359,7 +364,10 @@ class PublishVerificationTests(unittest.TestCase):
 
     def test_new_candidate_does_not_supersede_published_job(self) -> None:
         published = self._write_verified_receipt()
-        publish_verification.mark_published(published.job_dir, pr_number=414, remote_oid="a" * 40)
+        publish_verification.mark_published(
+            published.job_dir, pr_number=414, verified_sha="a" * 40,
+            env=self.env, git_runner=self._private_ref_git("a" * 40),
+        )
         newer = dict(self.identity)
         newer["candidate_sha"] = "b" * 40
 
@@ -371,16 +379,204 @@ class PublishVerificationTests(unittest.TestCase):
         self.assertTrue((published.job_dir / "published.json").is_file())
 
     def test_mark_published_records_pr_remote_oid_and_clears_retry_state(self) -> None:
-        result = self._prepared_job_without_child()
+        result = self._write_verified_receipt()
         publish_verification.record_job_retry(result.job_dir, "push-failed:7", now=1_000_000.0)
 
-        publish_verification.mark_published(result.job_dir, pr_number=414, remote_oid="a" * 40)
+        publish_verification.mark_published(
+            result.job_dir, pr_number=414, verified_sha="a" * 40,
+            env=self.env, git_runner=self._private_ref_git("a" * 40),
+        )
 
         payload = json.loads((result.job_dir / "published.json").read_text(encoding="utf-8"))
         self.assertEqual("PublishVerificationPublished", payload["schema"])
         self.assertEqual(414, payload["pr_number"])
         self.assertEqual("a" * 40, payload["remote_oid"])
         self.assertFalse((result.job_dir / "retry.json").exists())
+
+    def test_mark_published_adopts_exact_receipt_and_preserves_conflicts(self) -> None:
+        result = self._write_verified_receipt()
+        git = self._private_ref_git("a" * 40)
+        kwargs = {
+            "pr_number": 414, "verified_sha": "a" * 40,
+            "env": self.env, "git_runner": git,
+        }
+        publish_verification.mark_published(result.job_dir, **kwargs)
+        published_path = result.job_dir / "published.json"
+        exact_bytes = published_path.read_bytes()
+
+        publish_verification.mark_published(result.job_dir, **kwargs)
+        self.assertEqual(exact_bytes, published_path.read_bytes())
+
+        for label, payload in {
+            "conflicting-pr": {"schema": "PublishVerificationPublished", "pr_number": 415,
+                               "remote_oid": "a" * 40, "published_at_epoch": 1.0},
+            "conflicting-sha": {"schema": "PublishVerificationPublished", "pr_number": 414,
+                                "remote_oid": "b" * 40, "published_at_epoch": 1.0},
+            "malformed": {"schema": "PublishVerificationPublished", "pr_number": 414},
+        }.items():
+            with self.subTest(label=label):
+                published_path.write_text(json.dumps(payload), encoding="utf-8")
+                before = published_path.read_bytes()
+                with self.assertRaisesRegex(RuntimeError, "conflicts"):
+                    publish_verification.mark_published(result.job_dir, **kwargs)
+                self.assertEqual(before, published_path.read_bytes())
+
+    def test_mark_published_binds_immutable_verified_sha(self) -> None:
+        result = self._write_verified_receipt()
+        with self.assertRaisesRegex(RuntimeError, "identity is not verified"):
+            publish_verification.mark_published(
+                result.job_dir, pr_number=414, verified_sha="b" * 40,
+                env=self.env, git_runner=self._private_ref_git("a" * 40),
+            )
+        self.assertFalse((result.job_dir / "published.json").exists())
+
+    def test_published_receipt_rejects_symlink_and_non_regular_objects(self) -> None:
+        result = self._write_verified_receipt()
+        path = result.job_dir / "published.json"
+        target = result.job_dir / "external.json"
+        target.write_text(json.dumps({
+            "schema": "PublishVerificationPublished", "pr_number": 414,
+            "remote_oid": "a" * 40, "published_at_epoch": 1.0,
+        }), encoding="utf-8")
+        retry = result.job_dir / "retry.json"
+        retry.write_text("preserve", encoding="utf-8")
+        git = self._private_ref_git("a" * 40)
+        path.symlink_to(target)
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git).ok)
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            publish_verification.mark_published(
+                result.job_dir, pr_number=414, verified_sha="a" * 40, env=self.env, git_runner=git)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual("preserve", retry.read_text(encoding="utf-8"))
+
+        path.unlink()
+        for kind in ("directory", "fifo", "socket"):
+            with self.subTest(kind=kind):
+                listener = None
+                if kind == "directory":
+                    path.mkdir()
+                elif kind == "fifo":
+                    os.mkfifo(path)
+                else:
+                    listener = socket.socket(socket.AF_UNIX)
+                    try:
+                        listener.bind(str(path))
+                    except OSError:
+                        listener.close()
+                        continue
+                try:
+                    self.assertFalse(publish_verification.validate_published_receipt(
+                        result.job_dir, env=self.env, git_runner=git).ok)
+                finally:
+                    if listener is not None:
+                        listener.close()
+                    if kind == "directory":
+                        path.rmdir()
+                    else:
+                        path.unlink()
+
+    def test_published_receipt_digest_is_exact_bytes_and_parser_is_bounded(self) -> None:
+        result = self._write_verified_receipt()
+        git = self._private_ref_git("a" * 40)
+        publish_verification.mark_published(
+            result.job_dir, pr_number=414, verified_sha="a" * 40, env=self.env, git_runner=git)
+        path = result.job_dir / "published.json"
+        exact = path.read_bytes()
+        validation = publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git)
+        self.assertEqual(hashlib.sha256(exact).hexdigest(), validation.receipt_digest)
+        path.write_text('{"schema":"PublishVerificationPublished","schema":"PublishVerificationPublished",'
+                        '"pr_number":414,"remote_oid":"' + "a" * 40 + '","published_at_epoch":1}',
+                        encoding="utf-8")
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git).ok)
+        path.write_bytes(b"{" + b" " * publish_verification.PUBLISHED_RECEIPT_MAX_BYTES + b"}")
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git).ok)
+
+    def test_mark_published_binds_immutable_verified_sha_legacy_body(self) -> None:
+        result = self._write_verified_receipt()
+        with self.assertRaisesRegex(RuntimeError, "identity is not verified"):
+            publish_verification.mark_published(
+                result.job_dir, pr_number=414, verified_sha="b" * 40,
+                env=self.env, git_runner=self._private_ref_git("a" * 40),
+            )
+        self.assertFalse((result.job_dir / "published.json").exists())
+
+    def test_verified_and_published_receipt_tampering_fails_closed(self) -> None:
+        result = self._write_verified_receipt()
+        request_path = result.job_dir / "request.json"
+        result_path = result.job_dir / "result.json"
+        original_request = json.loads(request_path.read_text(encoding="utf-8"))
+        original_result = json.loads(result_path.read_text(encoding="utf-8"))
+        mutations = {
+            "request-extra": (request_path, {**original_request, "foreign_extra": True}),
+            "request-missing": (request_path, {key: value for key, value in original_request.items() if key != "action"}),
+            "request-schema": (request_path, {**original_request, "schema": "ForeignRequest"}),
+            "job": (request_path, {**original_request, "job_key": "0" * 32}),
+            "result-extra": (result_path, {**original_result, "foreign_extra": True}),
+            "result-missing": (result_path, {key: value for key, value in original_result.items() if key != "completed_at_epoch"}),
+            "digest": (result_path, {**original_result, "command_digest": "0" * 64}),
+            "sha": (result_path, {**original_result, "tested_sha": "b" * 40}),
+            "private-ref": (result_path, {**original_result, "private_ref": "refs/foreign"}),
+            "receipts": (result_path, {**original_result, "commands": []}),
+        }
+        for label, (path, row) in mutations.items():
+            with self.subTest(label=label):
+                request_path.write_text(json.dumps(original_request), encoding="utf-8")
+                result_path.write_text(json.dumps(original_result), encoding="utf-8")
+                path.write_text(json.dumps(row), encoding="utf-8")
+                validated = publish_verification.validate_verified_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        request_path.write_text(json.dumps(original_request), encoding="utf-8")
+        result_path.write_text(json.dumps(original_result), encoding="utf-8")
+
+        invalid_timestamps = (None, False, True, "1", 0, -1, float("nan"), float("inf"), float("-inf"))
+        for value in invalid_timestamps:
+            with self.subTest(completed_at_epoch=value):
+                result_path.write_text(
+                    json.dumps({**original_result, "completed_at_epoch": value}), encoding="utf-8",
+                )
+                validated = publish_verification.validate_verified_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        result_path.write_text(json.dumps(original_result), encoding="utf-8")
+
+        publish_verification.mark_published(
+            result.job_dir, pr_number=414, verified_sha="a" * 40,
+            env=self.env, git_runner=self._private_ref_git("a" * 40),
+        )
+        published_path = result.job_dir / "published.json"
+        original_published = json.loads(published_path.read_text(encoding="utf-8"))
+        for label, row in {
+            "schema": {**original_published, "schema": "ForeignPublished"},
+            "foreign-sha": {**original_published, "remote_oid": "b" * 40},
+            "foreign-pr": {**original_published, "pr_number": 0},
+            "extra-binding": {**original_published, "job_key": result.job_key},
+        }.items():
+            with self.subTest(published=label):
+                published_path.write_text(json.dumps(row), encoding="utf-8")
+                validated = publish_verification.validate_published_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        for value in invalid_timestamps:
+            with self.subTest(published_at_epoch=value):
+                published_path.write_text(
+                    json.dumps({**original_published, "published_at_epoch": value}), encoding="utf-8",
+                )
+                validated = publish_verification.validate_published_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        published_path.write_text("{", encoding="utf-8")
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+        ).ok)
 
     def test_failed_receipts_use_per_job_retry_schedule_then_quarantine(self) -> None:
         result = self._prepared_job_without_child()
@@ -461,6 +657,7 @@ class PublishVerificationTests(unittest.TestCase):
         request = json.loads((result.job_dir / "request.json").read_text(encoding="utf-8"))
         payload = {
             "schema": "PublishVerificationResult",
+            "version": publish_verification.VERIFY_VERSION,
             "status": "VERIFIED",
             "reason": "verified",
             "job_key": result.job_key,
@@ -472,6 +669,7 @@ class PublishVerificationTests(unittest.TestCase):
             "checkpoint_hashes": request["checkpoint_hashes"],
             "private_ref": request["private_ref"],
             "private_ref_oid": "a" * 40,
+            "completed_at_epoch": 1_001_800.0,
             "commands": [
                 {
                     "name": "BUILD_CMD",

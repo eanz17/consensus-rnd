@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import stat
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -18,11 +21,32 @@ from .processes import run_fixed_host_command
 
 VERIFY_VERSION = 2
 VERIFY_COMMANDS = ("BUILD_CMD", "TEST_CMD")
+PUBLISHED_RECEIPT_MAX_BYTES = 16 * 1024
 RETRY_DELAYS_SECONDS = (1800, 7200, 28800)
 REQUEST_SCHEMA = "PublishVerificationRequest"
 RESULT_SCHEMA = "PublishVerificationResult"
+REQUEST_KEYS = frozenset({
+    "schema", "version", "job_key", "issue", "action", "head_ref", "base_branch",
+    "worktree", "candidate_sha", "verified_sha", "gate_id", "command_digest",
+    "checkpoint_hashes", "commands", "host_env_locator", "private_ref",
+})
+RESULT_BASE_KEYS = frozenset({
+    "schema", "version", "status", "reason", "job_key", "verified_sha", "gate_id",
+    "command_digest", "checkpoint_hashes", "private_ref", "commands",
+})
+RESULT_MINIMAL_FAILED_KEYS = frozenset({"schema", "version", "status", "reason", "job_key", "verified_sha"})
+COMMAND_RECEIPT_KEYS = frozenset({"name", "command_sha256", "exit", "log", "exit_marker"})
 
 GitRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+
+def _is_writer_timestamp(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
 
 
 @dataclass(frozen=True)
@@ -45,10 +69,34 @@ class PublishVerificationReceiptValidation:
     job_dir: Path
     job_key: str
     verified_sha: str = ""
+    issue: str = ""
+    base_branch: str = ""
+    head_ref: str = ""
+    private_ref: str = ""
 
     @property
     def ok(self) -> bool:
         return self.status == "verified"
+
+
+@dataclass(frozen=True)
+class PublishVerificationPublishedValidation:
+    status: str
+    reason: str
+    job_dir: Path
+    job_key: str
+    verified_sha: str = ""
+    pr_number: int | None = None
+    remote_oid: str = ""
+    issue: str = ""
+    base_branch: str = ""
+    head_ref: str = ""
+    private_ref: str = ""
+    receipt_digest: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "published"
 
 
 @dataclass(frozen=True)
@@ -88,6 +136,7 @@ def prepare_or_schedule(
     issue: str,
     action: str,
     head_ref: str,
+    base_branch: str,
     candidate_sha: str,
     env: Mapping[str, str],
     git_runner: GitRunner | None = None,
@@ -101,6 +150,7 @@ def prepare_or_schedule(
         issue=issue,
         action=action,
         head_ref=head_ref,
+        base_branch=base_branch,
         candidate_sha=candidate_sha,
         env=env,
     )
@@ -177,6 +227,7 @@ def build_request(
     issue: str,
     action: str,
     head_ref: str,
+    base_branch: str,
     candidate_sha: str,
     env: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -189,6 +240,7 @@ def build_request(
         "issue": str(issue),
         "action": str(action),
         "head_ref": str(head_ref),
+        "base_branch": str(base_branch),
         "candidate_sha": str(candidate_sha),
         "gate_id": gate_id,
         "command_digest": digest,
@@ -201,6 +253,7 @@ def build_request(
         "issue": str(issue),
         "action": str(action),
         "head_ref": str(head_ref),
+        "base_branch": str(base_branch),
         "worktree": worktree_rel,
         "candidate_sha": str(candidate_sha),
         "verified_sha": str(candidate_sha),
@@ -303,18 +356,31 @@ def validate_verified_receipt(
     result_path = job_dir / "result.json"
     result = _read_json(result_path, {})
     job_key = str(request.get("job_key") or "")
-    if not isinstance(request, dict) or request.get("schema") != REQUEST_SCHEMA or not job_key:
+    if (not isinstance(request, dict) or set(request) != REQUEST_KEYS
+            or request.get("schema") != REQUEST_SCHEMA or not job_key):
         return PublishVerificationReceiptValidation("failed", "request-invalid", job_dir, job_key)
+    key_payload = {
+        "issue": request.get("issue"), "action": request.get("action"),
+        "head_ref": request.get("head_ref"), "base_branch": request.get("base_branch"),
+        "candidate_sha": request.get("candidate_sha"),
+        "gate_id": request.get("gate_id"), "command_digest": request.get("command_digest"),
+    }
+    expected_job_key = string_digest(json.dumps(key_payload, sort_keys=True, separators=(",", ":")))[:32]
+    if job_key != expected_job_key or job_dir.name != job_key:
+        return PublishVerificationReceiptValidation("failed", "job-key-mismatch", job_dir, job_key)
     if (job_dir / "superseded.json").exists():
         return PublishVerificationReceiptValidation("failed", "superseded", job_dir, job_key)
     if not result_path.exists():
         return PublishVerificationReceiptValidation("pending", "result-missing", job_dir, job_key)
-    if not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA:
+    if (not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA
+            or not _result_keys_are_canonical(result)):
         return PublishVerificationReceiptValidation("failed", "result-invalid", job_dir, job_key)
     if result.get("status") == "RUNNING":
         return PublishVerificationReceiptValidation("pending", "running", job_dir, job_key)
     if result.get("status") != "VERIFIED":
         return PublishVerificationReceiptValidation("failed", str(result.get("reason") or "not-verified"), job_dir, job_key)
+    if not _is_writer_timestamp(result.get("completed_at_epoch")):
+        return PublishVerificationReceiptValidation("failed", "completed-at-invalid", job_dir, job_key)
     for key in ("job_key", "verified_sha", "gate_id", "command_digest", "checkpoint_hashes", "private_ref"):
         if result.get(key) != request.get(key):
             return PublishVerificationReceiptValidation("failed", f"{key}-mismatch", job_dir, job_key)
@@ -333,7 +399,53 @@ def validate_verified_receipt(
     private_oid = _private_ref_oid(git, str(request["private_ref"]))
     if private_oid != candidate_sha or result.get("private_ref_oid") != private_oid:
         return PublishVerificationReceiptValidation("failed", "private-ref-mismatch", job_dir, job_key)
-    return PublishVerificationReceiptValidation("verified", "verified", job_dir, job_key, str(request["verified_sha"]))
+    issue = request.get("issue")
+    base_branch = request.get("base_branch")
+    head_ref = request.get("head_ref")
+    private_ref = request.get("private_ref")
+    if (not isinstance(issue, str) or not issue or not isinstance(base_branch, str) or not base_branch
+            or not isinstance(head_ref, str) or not head_ref or not isinstance(private_ref, str) or not private_ref):
+        return PublishVerificationReceiptValidation("failed", "request-identity-invalid", job_dir, job_key)
+    return PublishVerificationReceiptValidation(
+        "verified", "verified", job_dir, job_key, str(request["verified_sha"]),
+        issue, base_branch, head_ref, private_ref,
+    )
+
+
+def validate_published_receipt(
+    job_dir: Path,
+    *,
+    env: Mapping[str, str],
+    git_runner: GitRunner | None = None,
+) -> PublishVerificationPublishedValidation:
+    verified = validate_verified_receipt(job_dir, env=env, git_runner=git_runner)
+    if not verified.ok:
+        return PublishVerificationPublishedValidation(
+            "failed", f"verified-receipt-{verified.reason}", verified.job_dir, verified.job_key,
+        )
+    state, row, receipt_digest = _read_published_receipt(verified.job_dir)
+    if state == "MISSING":
+        return PublishVerificationPublishedValidation(
+            "verified", "published-missing", verified.job_dir, verified.job_key,
+            verified.verified_sha, None, "", verified.issue, verified.base_branch,
+            verified.head_ref, verified.private_ref,
+        )
+    if state != "VALID":
+        return PublishVerificationPublishedValidation("failed", "published-invalid", verified.job_dir, verified.job_key)
+    expected_keys = {"schema", "pr_number", "remote_oid", "published_at_epoch"}
+    if not isinstance(row, dict) or set(row) != expected_keys or row.get("schema") != "PublishVerificationPublished":
+        return PublishVerificationPublishedValidation("failed", "published-invalid", verified.job_dir, verified.job_key)
+    pr_number = row.get("pr_number")
+    published_at = row.get("published_at_epoch")
+    if (isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0
+            or not _is_writer_timestamp(published_at)
+            or row.get("remote_oid") != verified.verified_sha):
+        return PublishVerificationPublishedValidation("failed", "published-binding-invalid", verified.job_dir, verified.job_key)
+    return PublishVerificationPublishedValidation(
+        "published", "published", verified.job_dir, verified.job_key,
+        verified.verified_sha, pr_number, str(row["remote_oid"]), verified.issue,
+        verified.base_branch, verified.head_ref, verified.private_ref, receipt_digest,
+    )
 
 
 def record_failed_receipt_retry(job_dir: Path, *, now: float | None = None) -> PublishVerificationRetryStatus:
@@ -390,17 +502,136 @@ def current_retry_status(job_dir: Path, *, now: float | None = None) -> PublishV
     return PublishVerificationRetryStatus("NO_RETRY", "", 0, None)
 
 
-def mark_published(job_dir: Path, *, pr_number: int, remote_oid: str) -> None:
-    _write_json(
-        job_dir / "published.json",
-        {
-            "schema": "PublishVerificationPublished",
-            "pr_number": pr_number,
-            "remote_oid": remote_oid,
-            "published_at_epoch": time.time(),
-        },
-    )
+def mark_published(
+    job_dir: Path,
+    *,
+    pr_number: int,
+    verified_sha: str,
+    env: Mapping[str, str],
+    git_runner: GitRunner | None = None,
+) -> None:
+    verified = validate_verified_receipt(job_dir, env=env, git_runner=git_runner)
+    if (not verified.ok or verified.verified_sha != verified_sha
+            or isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0):
+        raise RuntimeError("publication receipt identity is not verified")
+
+    payload = {
+        "schema": "PublishVerificationPublished",
+        "pr_number": pr_number,
+        "remote_oid": verified_sha,
+        "published_at_epoch": time.time(),
+    }
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    expected_digest = hashlib.sha256(encoded).hexdigest()
+    dir_fd = _open_published_directory(verified.job_dir)
+    fd, temporary_name = tempfile.mkstemp(prefix=".published.", dir=verified.job_dir)
+    temporary_path = Path(temporary_name)
+    created = False
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary_path.name, "published.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+                    follow_symlinks=False)
+            os.fsync(dir_fd)
+            created = True
+        except FileExistsError:
+            published = validate_published_receipt(verified.job_dir, env=env, git_runner=git_runner)
+            if not published.ok or published.pr_number != pr_number or published.remote_oid != verified_sha:
+                raise RuntimeError("existing publication receipt conflicts with verified identity")
+        published = validate_published_receipt(verified.job_dir, env=env, git_runner=git_runner)
+        if (not published.ok or published.pr_number != pr_number or published.remote_oid != verified_sha
+                or (created and published.receipt_digest != expected_digest)):
+            raise RuntimeError("publication receipt postvalidation failed")
+    finally:
+        temporary_path.unlink(missing_ok=True)
+        os.close(dir_fd)
     (job_dir / "retry.json").unlink(missing_ok=True)
+
+
+def _open_published_directory(job_dir: Path) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("published receipt no-follow support unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        before = os.stat(job_dir, follow_symlinks=False)
+        fd = os.open(job_dir, flags)
+        opened = os.fstat(fd)
+        after = os.stat(job_dir, follow_symlinks=False)
+        if (not stat.S_ISDIR(opened.st_mode)
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise RuntimeError("published receipt directory identity changed")
+        return fd
+    except BaseException:
+        if "fd" in locals():
+            os.close(fd)
+        raise
+
+
+def _read_published_receipt(job_dir: Path) -> tuple[str, dict[str, Any], str]:
+    """Read the sole receipt basename without following or accepting object races."""
+    try:
+        dir_fd = _open_published_directory(job_dir)
+    except (OSError, RuntimeError):
+        return "INVALID", {}, ""
+    try:
+        try:
+            before = os.stat("published.json", dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "MISSING", {}, ""
+        except OSError:
+            return "INVALID", {}, ""
+        if not stat.S_ISREG(before.st_mode):
+            return "INVALID", {}, ""
+        try:
+            fd = os.open("published.json", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError:
+            return "INVALID", {}, ""
+        try:
+            opened = os.fstat(fd)
+            if ((before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode))
+                    != (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode))
+                    or not stat.S_ISREG(opened.st_mode)):
+                return "INVALID", {}, ""
+            data = b""
+            while len(data) <= PUBLISHED_RECEIPT_MAX_BYTES:
+                chunk = os.read(fd, PUBLISHED_RECEIPT_MAX_BYTES + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            finished = os.fstat(fd)
+        except OSError:
+            return "INVALID", {}, ""
+        finally:
+            os.close(fd)
+        try:
+            final = os.stat("published.json", dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return "INVALID", {}, ""
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (not data or len(data) > PUBLISHED_RECEIPT_MAX_BYTES
+                or any(getattr(opened, key) != getattr(finished, key) for key in stable_fields)
+                or (final.st_dev, final.st_ino, stat.S_IFMT(final.st_mode), final.st_size)
+                != (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode), opened.st_size)):
+            return "INVALID", {}, ""
+        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            row: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in row:
+                    raise ValueError("duplicate key")
+                row[key] = value
+            return row
+        row = json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        if not isinstance(row, dict):
+            return "INVALID", {}, ""
+        return "VALID", row, hashlib.sha256(data).hexdigest()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return "INVALID", {}, ""
+    finally:
+        os.close(dir_fd)
 
 
 def evidence_path(repo_root: Path, issue: str, head_ref: str) -> Path:
@@ -525,11 +756,35 @@ def _command_receipts_valid(commands: object, checkpoint_hashes: object) -> bool
     by_name = {item.get("name"): item for item in commands if isinstance(item, dict)}
     for name in VERIFY_COMMANDS:
         item = by_name.get(name)
-        if not isinstance(item, dict) or item.get("exit") != 0 or item.get("exit_marker") is not True:
+        if (not isinstance(item, dict) or set(item) != COMMAND_RECEIPT_KEYS
+                or item.get("exit") != 0 or item.get("exit_marker") is not True):
             return False
         if item.get("command_sha256") != checkpoint_hashes.get(name):
             return False
     return True
+
+
+def _result_keys_are_canonical(result: Mapping[str, Any]) -> bool:
+    status = result.get("status")
+    keys = frozenset(result)
+    if status == "VERIFIED":
+        return keys == RESULT_BASE_KEYS | {
+            "tested_sha", "post_tested_sha", "private_ref_oid", "completed_at_epoch",
+        }
+    if status == "RUNNING":
+        return keys in {
+            RESULT_BASE_KEYS,
+            RESULT_BASE_KEYS | {"tested_sha"},
+            RESULT_BASE_KEYS | {"tested_sha", "post_tested_sha"},
+        }
+    if status == "FAILED":
+        return keys == RESULT_MINIMAL_FAILED_KEYS or keys in {
+            RESULT_BASE_KEYS,
+            RESULT_BASE_KEYS | {"tested_sha"},
+            RESULT_BASE_KEYS | {"tested_sha", "post_tested_sha"},
+            RESULT_BASE_KEYS | {"tested_sha", "post_tested_sha", "private_ref_oid"},
+        }
+    return False
 
 
 def _env_for_child(repo_root: Path, request: Mapping[str, Any]) -> dict[str, str]:
@@ -645,4 +900,5 @@ __all__ = [
     "run_one_publish_ratchet",
     "string_digest",
     "validate_verified_receipt",
+    "validate_published_receipt",
 ]

@@ -638,7 +638,7 @@ class SkillEntrypointContractTests(unittest.TestCase):
                 self.assertNotIn(needle, skill_without_forbidden_history)
         for required in (
             "ControllerActions.open_design_issue_with_labels(title, body_file)",
-            "ControllerActions.safe_worktree(iteration, cluster, base)",
+            "ControllerTopologyAuthority.create_compliant_worktree",
             "ControllerActions.safe_push(remote, branch)",
             "ControllerActions.open_pr_with_label(title, body_file, base, head)",
             "consensus-rnd-cli pr-checks",
@@ -958,6 +958,44 @@ class SkillEntrypointContractTests(unittest.TestCase):
         ):
             with self.subTest(runtime_placeholder=runtime_placeholder):
                 self.assertIn(runtime_placeholder, rendered)
+
+    def test_controller_topology_authority_owner_boundary_is_explicit(self) -> None:
+        source = read(SKILL_ROOT / "scripts" / "codex_refactor_loop" / "controller_topology_authority.py")
+        actions = read(SKILL_ROOT / "scripts" / "codex_refactor_loop" / "controller_actions.py")
+        section = section_between(
+            self.skill,
+            r"^## Named runtime exception - ControllerTopologyAuthority$",
+            r"^## Named runtime exception - wakeup-runner",
+        )
+        self.assertIn("sole policy owner", section)
+        self.assertIn("<type>/YYYY-MM-DD_<purpose>", section)
+        self.assertIn("read only through `parse_legacy_implementation_head_evidence` as migration evidence", section)
+        for contract in (
+            "create_compliant_worktree",
+            "publish_exact_head",
+            "retire_superseded_pr",
+        ):
+            self.assertIn(f"def {contract}", source)
+            self.assertIn(f".{contract}(", actions)
+            self.assertNotIn(f"\n    def {contract}", actions)
+        self.assertNotIn('branch = f"refactor/iter', actions)
+        self.assertIn("def _create_compliant_worktree", actions)
+        self.assertNotIn("Mapping[str, object]", source)
+        self.assertNotIn("force", source)
+        for required in (
+            "CreateCompliantWorktreeRequest",
+            "ControllerTopologyAuthority.create_compliant_worktree",
+            "ControllerActions` is its private caller and effect adapter",
+            "ControllerTopologyIdentity",
+            "parse_legacy_implementation_head_evidence",
+        ):
+            self.assertIn(required, self.skill)
+        self.assertNotIn("ControllerActions.safe_worktree", self.skill)
+        self.assertNotIn("actions.safe_worktree", self.skill)
+        self.assertNotRegex(self.skill, r"(?m)^(?!.*(?:forbid|forbidden|reject)).*(?:fresh_)?safe_worktree\s*\(")
+        git_source = read(SKILL_ROOT / "scripts" / "codex_refactor_loop" / "git.py")
+        self.assertNotRegex(git_source, r"def (?:fresh_)?safe_worktree\s*\(")
+        self.assertNotRegex(actions, r"def (?:fresh_)?safe_worktree\s*\(")
 
 
 if __name__ == "__main__":

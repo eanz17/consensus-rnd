@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from .worker_markers import read_worker_terminal_marker
+from .controller_topology_authority import read_controller_topology_identity
 
 IMPLEMENT_DONE_OK_RE = re.compile(r"^IMPLEMENT_DONE:.+:ok$")
 IMPLEMENT_DONE_NON_OK_RE = re.compile(r"^IMPLEMENT_DONE:.+:(?:partial|blocked)$")
@@ -149,9 +150,14 @@ def implement_attempt_suppresses_expected_worker(
         marker = read_worker_terminal_marker(log_path).marker
         if _issue_from_any_implement_marker(marker) != issue:
             continue
+        action: dict[str, object] = {"target_number": issue}
+        identity = read_controller_topology_identity(repo_root, issue)
+        if identity is not None:
+            action["head_ref"], worktree = identity
+            action["worktree"] = str(worktree)
         state = classify_implement_attempt(
             repo_root=repo_root,
-            action={"target_number": issue, "iteration": str(issue), "cluster_id": match.group("cluster")},
+            action=action,
             log_path=log_path,
             integration_branch=integration_branch,
             command_runner=command_runner,
@@ -224,20 +230,21 @@ def clean_implement_done_marker(lines: list[str]) -> str:
 
 
 def canonical_implementation_identity(repo_root: Path, action: Mapping[str, object], marker: str) -> tuple[str, Path] | None:
-    target = action.get("target_number") or action.get("linked_issue")
+    """Consume the controller-owned durable identity; never construct a head."""
+    head_ref = str(action.get("head_ref") or "").strip()
+    worktree_text = str(action.get("worktree") or "").strip()
+    if not head_ref or not worktree_text:
+        return None
+    worktree = Path(worktree_text)
+    if not worktree.is_absolute():
+        return None
+    root = (repo_root / ".worktrees").resolve()
+    resolved = worktree.resolve()
     try:
-        issue = int(str(target))
-    except (TypeError, ValueError):
-        issue = _issue_from_marker(marker)
-    if issue is None:
+        resolved.relative_to(root)
+    except ValueError:
         return None
-    marker_id = marker.removeprefix("IMPLEMENT_DONE:").removesuffix(":ok").strip(":")
-    candidate = marker_id.replace("_", "-").strip("-") or f"issue-{issue}"
-    if not candidate:
-        return None
-    head_ref = f"refactor/iter{issue}-{candidate}"
-    worktree = (repo_root / ".worktrees" / f"iter{issue}-{candidate}").resolve()
-    return head_ref, worktree
+    return head_ref, resolved
 
 
 def _issue_from_marker(marker: str) -> int | None:

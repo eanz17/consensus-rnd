@@ -385,7 +385,7 @@ class ControllerActions:
         receipt = ReceiptState(
             request.receipt_id, receipt_status, issue_number, published.base_branch,
             published.head_ref, published.verified_sha,
-            published.pr_number if published.ok else None,
+            published.pr_number if published.ok else None, published.receipt_digest if published.ok else "",
         )
         worktree_state = self._topology_read_worktree(
             request.identity.branch, worktree, request.base_branch, request.configured_remote

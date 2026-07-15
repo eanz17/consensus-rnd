@@ -982,6 +982,20 @@ class SkillEntrypointContractTests(unittest.TestCase):
         self.assertIn("def _create_compliant_worktree", actions)
         self.assertNotIn("Mapping[str, object]", source)
         self.assertNotIn("force", source)
+        for required in (
+            "CreateCompliantWorktreeRequest",
+            "ControllerTopologyAuthority.create_compliant_worktree",
+            "ControllerActions` is its private caller and effect adapter",
+            "ControllerTopologyIdentity",
+            "parse_legacy_implementation_head_evidence",
+        ):
+            self.assertIn(required, self.skill)
+        self.assertNotIn("ControllerActions.safe_worktree", self.skill)
+        self.assertNotIn("actions.safe_worktree", self.skill)
+        self.assertNotRegex(self.skill, r"(?m)^(?!.*(?:forbid|forbidden|reject)).*(?:fresh_)?safe_worktree\s*\(")
+        git_source = read(SKILL_ROOT / "scripts" / "codex_refactor_loop" / "git.py")
+        self.assertNotRegex(git_source, r"def (?:fresh_)?safe_worktree\s*\(")
+        self.assertNotRegex(actions, r"def (?:fresh_)?safe_worktree\s*\(")
 
 
 if __name__ == "__main__":

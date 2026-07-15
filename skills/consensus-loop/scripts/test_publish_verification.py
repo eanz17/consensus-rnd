@@ -3,7 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import socket
 import shutil
 import subprocess
 import tempfile
@@ -419,6 +422,80 @@ class PublishVerificationTests(unittest.TestCase):
                 self.assertEqual(before, published_path.read_bytes())
 
     def test_mark_published_binds_immutable_verified_sha(self) -> None:
+        result = self._write_verified_receipt()
+        with self.assertRaisesRegex(RuntimeError, "identity is not verified"):
+            publish_verification.mark_published(
+                result.job_dir, pr_number=414, verified_sha="b" * 40,
+                env=self.env, git_runner=self._private_ref_git("a" * 40),
+            )
+        self.assertFalse((result.job_dir / "published.json").exists())
+
+    def test_published_receipt_rejects_symlink_and_non_regular_objects(self) -> None:
+        result = self._write_verified_receipt()
+        path = result.job_dir / "published.json"
+        target = result.job_dir / "external.json"
+        target.write_text(json.dumps({
+            "schema": "PublishVerificationPublished", "pr_number": 414,
+            "remote_oid": "a" * 40, "published_at_epoch": 1.0,
+        }), encoding="utf-8")
+        retry = result.job_dir / "retry.json"
+        retry.write_text("preserve", encoding="utf-8")
+        git = self._private_ref_git("a" * 40)
+        path.symlink_to(target)
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git).ok)
+        with self.assertRaisesRegex(RuntimeError, "conflicts"):
+            publish_verification.mark_published(
+                result.job_dir, pr_number=414, verified_sha="a" * 40, env=self.env, git_runner=git)
+        self.assertTrue(path.is_symlink())
+        self.assertEqual("preserve", retry.read_text(encoding="utf-8"))
+
+        path.unlink()
+        for kind in ("directory", "fifo", "socket"):
+            with self.subTest(kind=kind):
+                listener = None
+                if kind == "directory":
+                    path.mkdir()
+                elif kind == "fifo":
+                    os.mkfifo(path)
+                else:
+                    listener = socket.socket(socket.AF_UNIX)
+                    try:
+                        listener.bind(str(path))
+                    except OSError:
+                        listener.close()
+                        continue
+                try:
+                    self.assertFalse(publish_verification.validate_published_receipt(
+                        result.job_dir, env=self.env, git_runner=git).ok)
+                finally:
+                    if listener is not None:
+                        listener.close()
+                    if kind == "directory":
+                        path.rmdir()
+                    else:
+                        path.unlink()
+
+    def test_published_receipt_digest_is_exact_bytes_and_parser_is_bounded(self) -> None:
+        result = self._write_verified_receipt()
+        git = self._private_ref_git("a" * 40)
+        publish_verification.mark_published(
+            result.job_dir, pr_number=414, verified_sha="a" * 40, env=self.env, git_runner=git)
+        path = result.job_dir / "published.json"
+        exact = path.read_bytes()
+        validation = publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git)
+        self.assertEqual(hashlib.sha256(exact).hexdigest(), validation.receipt_digest)
+        path.write_text('{"schema":"PublishVerificationPublished","schema":"PublishVerificationPublished",'
+                        '"pr_number":414,"remote_oid":"' + "a" * 40 + '","published_at_epoch":1}',
+                        encoding="utf-8")
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git).ok)
+        path.write_bytes(b"{" + b" " * publish_verification.PUBLISHED_RECEIPT_MAX_BYTES + b"}")
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=git).ok)
+
+    def test_mark_published_binds_immutable_verified_sha_legacy_body(self) -> None:
         result = self._write_verified_receipt()
         with self.assertRaisesRegex(RuntimeError, "identity is not verified"):
             publish_verification.mark_published(

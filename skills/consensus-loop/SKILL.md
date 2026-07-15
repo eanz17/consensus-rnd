@@ -383,6 +383,7 @@ Forbidden: no `UNMANAGED_ISSUE_INTAKE_ENABLE`, `UnmanagedIssueIntakeClaim`, `int
 
 <a id="controller-topology-authority"></a>
 ## Named runtime exception - ControllerTopologyAuthority
+The published receipt is a no-follow regular object identified by SHA-256 of its exact bytes after exact-schema and verified-chain validation. Missing creation uses an exclusive same-directory link; only an exact valid PR/SHA binding is adoptable, while symlink, non-regular, malformed, replacement, or conflicting objects fail closed and preserve retry state. Terminal provenance stores the exact-byte digest only after two agreeing reads, and terminal reentry requires equality with the stored digest. This receipt evidence remains subordinate to fresh #191 immediately before the receipt effect and terminal CAS.
 Authorization source: `skills/consensus-loop/authorizations/runtime-exceptions.md#controller-topology-authority`. `scripts/codex_refactor_loop/controller_topology_authority.py::ControllerTopologyAuthority` is the sole policy owner for `create_compliant_worktree(CreateCompliantWorktreeRequest)`, `publish_exact_head(PublishExactHeadRequest)`, and `retire_superseded_pr(RetireSupersededPRRequest)`. Production callers submit one complete frozen typed intent; `ControllerActions` is only the injected narrow effect gateway and caller boundary. The authority reads and validates every caller/file/git/GitHub fact before the first external mutation, performs ordered live postchecks, and never exposes partial topology operations to callers.
 
 Allowed: create only `<type>/YYYY-MM-DD_<purpose>` branches and controller-owned worktrees at an exact authorized base; publish an independently authorized exact commit `F` through a non-force literal-SHA ref update and prove the configured remote equals `F`; and retire a superseded old PR only after fresh reads prove both PRs remain managed and equivalent, the linked issue remains OPEN, and required-role reviews remain bound to the replacement live head. Creation and publication share the sole exact `publication:<branch>` provenance family; disconnected `create__` records have no read or compatibility semantics. Publication stores and freshly reproves `final_tree_sha` and `final_diff_digest`. Retirement stores an immutable `sentinel_digest`, posts exactly one structured marker, and after posting requires exactly one tuple-matched rediscovered `sentinel_url`; zero is never proof of a claimed post. The immutable create/publication phases are `CREATE_PREPARED -> WORKTREE_CREATED -> PUBLISH_PREPARED -> LOCAL_REF_READY -> REMOTE_REF_PUBLISHED -> PR_FINALIZED -> PUBLICATION_RECEIPT_FINALIZED`; the independent retirement phases are `RETIREMENT_PREPARED -> SUPERSESSION_POSTED -> OLD_PR_CLOSED`. Every transition and adoption rereads complete live facts, performs at most its named effect, proves exact poststate, and obtains fresh #191 immediately before every effect and generation/digest CAS. Terminal reentry performs no effect or CAS and fully reproves live state. Failure keeps the prior durable phase; retry rereads and may adopt only an exact completed effect. Existing `refactor/iter<I>-<cluster>` heads are read only through `parse_legacy_implementation_head_evidence` as migration evidence for an already-open legacy PR; they are never emitted or used as authority.
@@ -1647,7 +1648,9 @@ MERGE_WITH_COMMENTS has already been decided. -->
 
 ```python
 actions = ControllerActions(LoopContext.load(cwd=os.getcwd()))
-actions.safe_worktree(iteration, cluster, base)
+actions._topology_authority().create_compliant_worktree(
+    CreateCompliantWorktreeRequest(identity=identity, base_ref=base, base_sha=base_sha)
+)
 actions.open_pr_with_label(title, body_file, base=base, head=head)
 actions.merge_pr(pr)
 actions.render_template(input_path, output_path)
@@ -1658,7 +1661,7 @@ actions.apply_human_label_or_skip(pr_number, source_marker, reason)
 - 派 codex 前必须 validate rendered prompt output — 防 codex blocked on unresolved placeholder
 - Controller-opened PRs must use internal `open_pr_with_label(...)`; it creates open PRs as draft by default (`gh pr create --draft`) before labels are applied.
 - merge PR 必须用 internal `merge_pr(pr)` — post-decision ready+merge + auto-close + label cleanup,不留尾巴。`merge_pr` first checks draft state and, only when the controller has already decided `MERGE` or `MERGE_WITH_COMMENTS`, marks the PR ready before `gh pr merge`; it never computes Consensus-rnd Phase review-gate reviewer policy.
-- worktree 创建必须用 internal `safe_worktree(iteration, cluster, base)` — 处理 "already exists" race
+- Worktree creation must use one complete `CreateCompliantWorktreeRequest` through the sole `ControllerTopologyAuthority.create_compliant_worktree(...)` transaction. It alone owns creation, existing-worktree/ref race adoption, and fail-closed collision rejection; direct partial worktree effects are forbidden.
 - PR 号捕获必须用 internal `open_pr_with_label(...)` returned tuple — **禁止** shell `pr_num=$(...grep -oE...)` 这种 subshell 变量传值模式
 - Lifecycle PR/issue targets entering `apply_human_label_or_skip`, `merge_pr`, `open_pr_with_label`, or `record_recent_pr_merge` must pass `_normalize_lifecycle_target` and become canonical positive decimals before any `gh` or `git` side effect; empty, blank, zero, negative, non-digit, leading-zero, URL, branch, and current-PR inference inputs fail closed and write `CONTROLLER_ACTION_BLOCKED:invalid-github-target:<action>:<kind>:<source>` to the controller pending-event log. PR creation target capture stays limited to `open_pr_with_label(...)` URL extraction followed by the same normalization.
 - `safe_push`, `ControllerActions.safe_push(remote, branch)`, `safe_sync_main`, triage apply, and human-label apply are internal primitives/direct package calls only; `consensus-rnd-cli merge-pr/open-pr/open-release-rollup-pr/apply-human-label/safe-push/safe-sync-main/apply-sync/apply-triage` must fail closed as unknown public commands. Implementation publish finalization uses the `publish_verification.py` verified literal object push instead of this branch-oriented primitive.
@@ -1913,10 +1916,12 @@ in-flight cluster worktrees only.
 
 For each cluster in the current batch:
 
-1. Create or reuse the implementation worktree through
-   `ControllerActions.safe_worktree(iteration, cluster, base)`, which owns the
-   branch/path naming contract and keeps controller worktrees under
-   `$REPO_ROOT/.worktrees/`.
+1. Create or reuse the implementation worktree through the owner-private typed
+   `ControllerTopologyAuthority.create_compliant_worktree(...)` transaction.
+   `ControllerActions` is its private caller and effect adapter;
+   `ControllerTopologyIdentity` supplies the canonical branch identity and path.
+   Legacy `refactor/iter<I>-<cluster>` names are read-only evidence solely through
+   `parse_legacy_implementation_head_evidence`.
 
 2. Materialize prompt: copy `prompts/implement.md`, replace placeholders (`{{work_unit_id}}`,
    `{{cluster_id}}`, `{{worktree_path}}`, `{{branch}}`, `{{old_pattern}}`, `{{new_principle}}`,

@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -59,6 +60,7 @@ from codex_refactor_loop.issue_decomposition import issue_decomposition_plan_fil
 from codex_refactor_loop.issue_decomposition import issue_decomposition_child_fingerprint
 from codex_refactor_loop.managed_work_snapshot import ManagedWorkSnapshotItem, ManagedWorkSnapshotResult
 from codex_refactor_loop.prompt_contracts import GITHUB_POST_RULES_CONTRACT_TOKEN
+from codex_refactor_loop import publish_verification
 from codex_refactor_loop.publish_verification import (
     PublishVerificationJobResult, PublishVerificationPublishedValidation,
 )
@@ -286,6 +288,189 @@ class ControllerActionsTests(unittest.TestCase):
         self.assertEqual((41, final_sha), (kwargs["pr_number"], kwargs["verified_sha"]))
         self.assertEqual(self.tmp.resolve(), Path(kwargs["env"]["REPO_ROOT"]).resolve())
         self.assertTrue(callable(kwargs["git_runner"]))
+
+    def _production_publication_fixture(self):
+        final_sha = "f" * 40
+        tree_sha = "d" * 40
+        diff_text = "production adapter diff\n"
+        diff_digest = hashlib.sha256(diff_text.encode()).hexdigest()
+        identity = ControllerTopologyIdentity(77, "issue-77", "refactor", date(2026, 7, 15))
+        worktree = self.tmp / ".worktrees" / identity.worktree_name
+        worktree.mkdir(parents=True, exist_ok=True)
+
+        request_row = publish_verification.build_request(
+            repo_root=self.tmp, worktree=worktree, issue="77", action="publish_implementation_output",
+            head_ref=identity.branch, base_branch="canonical-integration", candidate_sha=final_sha,
+            env=self.actions.ctx.env_for_subprocess(),
+        )
+        private_ref = str(request_row["private_ref"])
+        job_dir = self.tmp / ".refactor-loop/state/publish-verification/jobs" / str(request_row["job_key"])
+        job_dir.mkdir(parents=True)
+        (job_dir / "request.json").write_text(json.dumps(request_row, sort_keys=True) + "\n", encoding="utf-8")
+        result_row = {
+            "schema": "PublishVerificationResult", "version": publish_verification.VERIFY_VERSION,
+            "status": "VERIFIED", "reason": "verified", "job_key": request_row["job_key"],
+            "verified_sha": final_sha, "tested_sha": final_sha, "post_tested_sha": final_sha,
+            "gate_id": request_row["gate_id"], "command_digest": request_row["command_digest"],
+            "checkpoint_hashes": request_row["checkpoint_hashes"],
+            "private_ref": private_ref, "private_ref_oid": final_sha,
+            "completed_at_epoch": 1.0, "commands": [
+                {"name": name, "command_sha256": publish_verification.string_digest(command), "exit": 0,
+                 "exit_marker": True, "log": f".refactor-loop/state/publish-verification/jobs/x/{name}.log"}
+                for name, command in request_row["commands"].items()
+            ],
+        }
+        (job_dir / "result.json").write_text(json.dumps(result_row, sort_keys=True) + "\n", encoding="utf-8")
+
+        title_digest = hashlib.sha256(b"Canonical").hexdigest()
+        body_digest = hashlib.sha256(b"Closes #77").hexdigest()
+        request = PublishExactHeadRequest(identity, final_sha, "upstream", "canonical-integration", 9,
+                                          str(job_dir), title_digest, body_digest)
+        record = TopologyProvenance(
+            f"publication:{identity.branch}", TopologyPhase.PR_FINALIZED, 6, "", 77, "issue-77",
+            "refactor", "2026-07-15", identity.branch, str(worktree), "origin/dev", "b" * 40,
+            configured_remote="upstream", base_branch="canonical-integration", final_sha=final_sha,
+            final_tree_sha=tree_sha, final_diff_digest=diff_digest, receipt_id=str(job_dir),
+            legacy_pr_number=9, legacy_head="refactor/iter77-issue-77", pr_number=41,
+            title_digest=title_digest, body_digest=body_digest,
+        ).exact()
+        path = self.actions._topology_provenance_path(record.key)
+        path.write_text(json.dumps({**record.payload(), "digest": record.digest}, sort_keys=True) + "\n",
+                        encoding="utf-8")
+        state = {"head": final_sha, "remote": final_sha}
+        events: list[str] = []
+
+        def pr_facts(number: int) -> PRState:
+            head = state["head"] if number == 41 else final_sha
+            return PRState(number, "OPEN", True, "canonical-integration",
+                           identity.branch if number == 41 else "refactor/iter77-issue-77", head,
+                           tree_sha, title_digest if number == 41 else "0" * 64,
+                           body_digest if number == 41 else "0" * 64, diff_digest, (77,))
+
+        def worktree_facts(branch: str, path: Path, base: str, remote: str) -> WorktreeState:
+            return WorktreeState("b" * 40, final_sha, state["remote"], True, identity.branch,
+                                 final_sha, True, False, (41,))
+
+        def git_facts(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            argv = list(args)
+            if argv[:2] == ["rev-parse", "--verify"]:
+                return subprocess.CompletedProcess(argv, 0, final_sha + "\n", "")
+            if argv[0] == "cat-file": return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[0] == "rev-parse": return subprocess.CompletedProcess(argv, 0, tree_sha + "\n", "")
+            if argv[0] == "diff": return subprocess.CompletedProcess(argv, 0, diff_text, "")
+            raise AssertionError(f"unexpected git fact: {argv}")
+
+        return request, record, job_dir, state, events, pr_facts, worktree_facts, git_facts
+
+    def test_production_adapter_receipt_head_race_retry_and_terminal_reentry(self) -> None:
+        request, _, job_dir, state, events, pr_facts, worktree_facts, git_facts = self._production_publication_fixture()
+        real_cas = self.actions._topology_cas_provenance
+        real_receipt = self.actions._topology_finalize_receipt
+        real_read = self.actions._topology_read_publication
+        link_count = 0
+        real_link = os.link
+
+        def fresh(action: str) -> None:
+            events.append(f"fresh:{action}")
+
+        def receipt(*args) -> None:
+            events.append("effect:receipt")
+            real_receipt(*args)
+            state["head"] = "a" * 40
+
+        def read(*args):
+            events.append(f"read:{state['head']}")
+            return real_read(*args)
+
+        def cas(*args) -> None:
+            events.append("cas")
+            real_cas(*args)
+
+        def link(*args, **kwargs) -> None:
+            nonlocal link_count
+            link_count += 1
+            real_link(*args, **kwargs)
+
+        patches = (
+            mock.patch.object(self.actions, "_topology_require_fresh_owner", side_effect=fresh),
+            mock.patch.object(self.actions, "_topology_cas_provenance", side_effect=cas),
+            mock.patch.object(self.actions, "_topology_finalize_receipt", side_effect=receipt),
+            mock.patch.object(self.actions, "_topology_read_publication", side_effect=read),
+            mock.patch.object(self.actions, "_topology_open_pr_numbers", return_value=(41,)),
+            mock.patch.object(self.actions, "_topology_pr_facts", side_effect=pr_facts),
+            mock.patch.object(self.actions, "_topology_issue_state", return_value="OPEN"),
+            mock.patch.object(self.actions, "_topology_read_worktree", side_effect=worktree_facts),
+            mock.patch.object(self.actions, "git", side_effect=git_facts), mock.patch("os.link", side_effect=link),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6], patches[7], patches[8], patches[9]:
+            with self.assertRaisesRegex(Exception, "PR proof changed"):
+                self.actions._topology_authority().publish_exact_head(request)
+            published = job_dir / "published.json"
+            exact_bytes, exact_stat = published.read_bytes(), published.stat()
+            provenance_key = f"publication:{request.identity.branch}"
+            self.assertEqual((1, TopologyPhase.PR_FINALIZED, 6),
+                             (link_count, self.actions._topology_read_provenance(provenance_key).phase,
+                              self.actions._topology_read_provenance(provenance_key).generation))
+            with self.assertRaisesRegex(Exception, "PR finalization proof changed"):
+                self.actions._topology_authority().publish_exact_head(request)
+            self.assertEqual(1, link_count)
+            state["head"] = request.final_sha
+            result = self.actions._topology_authority().publish_exact_head(request)
+            terminal = self.actions._topology_read_provenance(provenance_key)
+            self.assertEqual((TopologyPhase.PUBLICATION_RECEIPT_FINALIZED, 7), (result.phase, terminal.generation))
+            self.assertEqual(hashlib.sha256(exact_bytes).hexdigest(), terminal.publication_receipt_digest)
+            self.assertEqual((exact_bytes, exact_stat.st_ino), (published.read_bytes(), published.stat().st_ino))
+            before = (link_count, events.count("cas"), len(events))
+            self.actions._topology_authority().publish_exact_head(request)
+            self.assertEqual((before[0], before[1]), (link_count, events.count("cas")))
+            changed = json.loads(published.read_text(encoding="utf-8"))
+            changed["published_at_epoch"] += 1
+            published.write_text(json.dumps(changed, sort_keys=True) + "\n", encoding="utf-8")
+            effects_and_cas = (events.count("effect:receipt"), events.count("cas"))
+            with self.assertRaisesRegex(Exception, "digest changed"):
+                self.actions._topology_authority().publish_exact_head(request)
+            self.assertEqual(effects_and_cas, (events.count("effect:receipt"), events.count("cas")))
+        self.assertEqual(
+            [f"read:{request.final_sha}", "fresh:controller topology: receipt finalization effect",
+             "effect:receipt", "read:" + "a" * 40, "read:" + "a" * 40,
+             f"read:{request.final_sha}", f"read:{request.final_sha}",
+             "fresh:controller topology: publication terminal CAS", "cas",
+             f"read:{request.final_sha}", f"read:{request.final_sha}"],
+            events,
+        )
+
+    def test_production_adapter_remote_conflict_fails_before_receipt(self) -> None:
+        request, record, job_dir, state, _, pr_facts, worktree_facts, git_facts = self._production_publication_fixture()
+        state["remote"] = "a" * 40
+        record = replace(record, phase=TopologyPhase.LOCAL_REF_READY, generation=3, digest="", pr_number=0).exact()
+        path = self.actions._topology_provenance_path(record.key)
+        path.write_text(json.dumps({**record.payload(), "digest": record.digest}, sort_keys=True) + "\n",
+                        encoding="utf-8")
+        with mock.patch.object(self.actions, "_topology_open_pr_numbers", return_value=(41,)), \
+                mock.patch.object(self.actions, "_topology_pr_facts", side_effect=pr_facts), \
+                mock.patch.object(self.actions, "_topology_issue_state", return_value="OPEN"), \
+                mock.patch.object(self.actions, "_topology_read_worktree", side_effect=worktree_facts), \
+                mock.patch.object(self.actions, "git", side_effect=git_facts):
+            with self.assertRaisesRegex(Exception, "remote ref collision"):
+                self.actions._topology_authority().publish_exact_head(request)
+        self.assertFalse((job_dir / "published.json").exists())
+
+    def test_production_adapter_conflicting_receipt_preserves_object_and_provenance(self) -> None:
+        request, _, job_dir, _, _, pr_facts, worktree_facts, git_facts = self._production_publication_fixture()
+        published = job_dir / "published.json"
+        published.write_text(json.dumps({"schema": "PublishVerificationPublished", "pr_number": 42,
+                                         "remote_oid": request.final_sha, "published_at_epoch": 1.0}) + "\n",
+                             encoding="utf-8")
+        before = published.read_bytes()
+        with mock.patch.object(self.actions, "_topology_open_pr_numbers", return_value=(41,)), \
+                mock.patch.object(self.actions, "_topology_pr_facts", side_effect=pr_facts), \
+                mock.patch.object(self.actions, "_topology_issue_state", return_value="OPEN"), \
+                mock.patch.object(self.actions, "_topology_read_worktree", side_effect=worktree_facts), \
+                mock.patch.object(self.actions, "git", side_effect=git_facts):
+            with self.assertRaisesRegex(Exception, "receipt identity mismatch"):
+                self.actions._topology_authority().publish_exact_head(request)
+        record = self.actions._topology_read_provenance(f"publication:{request.identity.branch}")
+        self.assertEqual((before, TopologyPhase.PR_FINALIZED, 6), (published.read_bytes(), record.phase, record.generation))
 
     def test_topology_read_retirement_maps_prs_sentinel_and_fails_closed_on_unavailable_pr(self) -> None:
         final_sha = "a" * 40

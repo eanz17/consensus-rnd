@@ -10,6 +10,8 @@ in `SKILL.md` and the tests.
 <a id="controller-topology-authority"></a>
 ## ControllerTopologyAuthority
 
+- receipt_boundary: `published.json` is observed as a no-follow regular object and identified by SHA-256 of its exact bytes after exact-schema and verified-chain validation. Missing creation uses an exclusive same-directory link; only an exact valid PR/SHA binding is adoptable, while symlink, non-regular, malformed, replacement, or conflicting state fails closed and preserves retry state. Terminal provenance stores the exact-byte digest only after two agreeing reads, and terminal reentry requires equality with that stored digest. Receipt evidence grants no authority and remains subordinate to fresh #191 immediately before the receipt effect and terminal CAS.
+
 - surface: `controller-private typed topology transactions`
 - source_issue: `#2737`
 - source_round: `r21`

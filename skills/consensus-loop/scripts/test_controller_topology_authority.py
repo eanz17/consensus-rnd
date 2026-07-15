@@ -26,6 +26,7 @@ BASE = "b" * 40
 F = "f" * 40
 TREE = "a" * 40
 DIFF = "d" * 64
+RECEIPT_DIGEST = "c" * 64
 
 
 class FakePort:
@@ -118,7 +119,8 @@ class FakePort:
         self.calls.append("EFFECT:receipt")
         if self.fail_effect == "receipt": raise RuntimeError("receipt effect failed")
         if verified_sha != F: raise AssertionError("receipt SHA changed")
-        self.receipt = replace(self.receipt, status="PUBLISHED", pr_number=pr_number)
+        self.receipt = replace(self.receipt, status="PUBLISHED", pr_number=pr_number,
+                               receipt_digest=RECEIPT_DIGEST)
         if self.race_pr_head_on_receipt:
             self.prs = (replace(self.prs[0], head_sha="e" * 40),)
 
@@ -208,6 +210,12 @@ class AuthorityTests(unittest.TestCase):
 
         self.assertEqual(TopologyPhase.PUBLICATION_RECEIPT_FINALIZED, result.phase)
         self.assertEqual(receipt_effects, self.port.calls.count("EFFECT:receipt"))
+        record = self.port.records[f"publication:{self.identity.branch}"]
+        self.assertEqual(RECEIPT_DIGEST, record.publication_receipt_digest)
+
+        self.port.receipt = replace(self.port.receipt, receipt_digest="e" * 64)
+        with self.assertRaisesRegex(ControllerTopologyError, "digest changed"):
+            self.owner.publish_exact_head(self.publish)
 
     def test_branch_only_partial_state_is_exactly_adopted_without_recreate(self):
         self.port.deny_at = 2

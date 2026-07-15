@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import stat
 import subprocess
 import tempfile
 import time
@@ -20,6 +21,7 @@ from .processes import run_fixed_host_command
 
 VERIFY_VERSION = 2
 VERIFY_COMMANDS = ("BUILD_CMD", "TEST_CMD")
+PUBLISHED_RECEIPT_MAX_BYTES = 16 * 1024
 RETRY_DELAYS_SECONDS = (1800, 7200, 28800)
 REQUEST_SCHEMA = "PublishVerificationRequest"
 RESULT_SCHEMA = "PublishVerificationResult"
@@ -90,6 +92,7 @@ class PublishVerificationPublishedValidation:
     base_branch: str = ""
     head_ref: str = ""
     private_ref: str = ""
+    receipt_digest: str = ""
 
     @property
     def ok(self) -> bool:
@@ -420,14 +423,15 @@ def validate_published_receipt(
         return PublishVerificationPublishedValidation(
             "failed", f"verified-receipt-{verified.reason}", verified.job_dir, verified.job_key,
         )
-    path = verified.job_dir / "published.json"
-    row = _read_json(path, {})
-    if not path.exists():
+    state, row, receipt_digest = _read_published_receipt(verified.job_dir)
+    if state == "MISSING":
         return PublishVerificationPublishedValidation(
             "verified", "published-missing", verified.job_dir, verified.job_key,
             verified.verified_sha, None, "", verified.issue, verified.base_branch,
             verified.head_ref, verified.private_ref,
         )
+    if state != "VALID":
+        return PublishVerificationPublishedValidation("failed", "published-invalid", verified.job_dir, verified.job_key)
     expected_keys = {"schema", "pr_number", "remote_oid", "published_at_epoch"}
     if not isinstance(row, dict) or set(row) != expected_keys or row.get("schema") != "PublishVerificationPublished":
         return PublishVerificationPublishedValidation("failed", "published-invalid", verified.job_dir, verified.job_key)
@@ -440,7 +444,7 @@ def validate_published_receipt(
     return PublishVerificationPublishedValidation(
         "published", "published", verified.job_dir, verified.job_key,
         verified.verified_sha, pr_number, str(row["remote_oid"]), verified.issue,
-        verified.base_branch, verified.head_ref, verified.private_ref,
+        verified.base_branch, verified.head_ref, verified.private_ref, receipt_digest,
     )
 
 
@@ -511,30 +515,123 @@ def mark_published(
             or isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0):
         raise RuntimeError("publication receipt identity is not verified")
 
-    path = verified.job_dir / "published.json"
     payload = {
         "schema": "PublishVerificationPublished",
         "pr_number": pr_number,
         "remote_oid": verified_sha,
         "published_at_epoch": time.time(),
     }
+    encoded = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+    expected_digest = hashlib.sha256(encoded).hexdigest()
+    dir_fd = _open_published_directory(verified.job_dir)
     fd, temporary_name = tempfile.mkstemp(prefix=".published.", dir=verified.job_dir)
     temporary_path = Path(temporary_name)
+    created = False
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, sort_keys=True)
-            handle.write("\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.link(temporary_path, path)
+            os.link(temporary_path.name, "published.json", src_dir_fd=dir_fd, dst_dir_fd=dir_fd,
+                    follow_symlinks=False)
+            os.fsync(dir_fd)
+            created = True
         except FileExistsError:
             published = validate_published_receipt(verified.job_dir, env=env, git_runner=git_runner)
             if not published.ok or published.pr_number != pr_number or published.remote_oid != verified_sha:
                 raise RuntimeError("existing publication receipt conflicts with verified identity")
+        published = validate_published_receipt(verified.job_dir, env=env, git_runner=git_runner)
+        if (not published.ok or published.pr_number != pr_number or published.remote_oid != verified_sha
+                or (created and published.receipt_digest != expected_digest)):
+            raise RuntimeError("publication receipt postvalidation failed")
     finally:
         temporary_path.unlink(missing_ok=True)
+        os.close(dir_fd)
     (job_dir / "retry.json").unlink(missing_ok=True)
+
+
+def _open_published_directory(job_dir: Path) -> int:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise RuntimeError("published receipt no-follow support unavailable")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        before = os.stat(job_dir, follow_symlinks=False)
+        fd = os.open(job_dir, flags)
+        opened = os.fstat(fd)
+        after = os.stat(job_dir, follow_symlinks=False)
+        if (not stat.S_ISDIR(opened.st_mode)
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                or (after.st_dev, after.st_ino) != (opened.st_dev, opened.st_ino)):
+            raise RuntimeError("published receipt directory identity changed")
+        return fd
+    except BaseException:
+        if "fd" in locals():
+            os.close(fd)
+        raise
+
+
+def _read_published_receipt(job_dir: Path) -> tuple[str, dict[str, Any], str]:
+    """Read the sole receipt basename without following or accepting object races."""
+    try:
+        dir_fd = _open_published_directory(job_dir)
+    except (OSError, RuntimeError):
+        return "INVALID", {}, ""
+    try:
+        try:
+            before = os.stat("published.json", dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return "MISSING", {}, ""
+        except OSError:
+            return "INVALID", {}, ""
+        if not stat.S_ISREG(before.st_mode):
+            return "INVALID", {}, ""
+        try:
+            fd = os.open("published.json", os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dir_fd)
+        except OSError:
+            return "INVALID", {}, ""
+        try:
+            opened = os.fstat(fd)
+            if ((before.st_dev, before.st_ino, stat.S_IFMT(before.st_mode))
+                    != (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode))
+                    or not stat.S_ISREG(opened.st_mode)):
+                return "INVALID", {}, ""
+            data = b""
+            while len(data) <= PUBLISHED_RECEIPT_MAX_BYTES:
+                chunk = os.read(fd, PUBLISHED_RECEIPT_MAX_BYTES + 1 - len(data))
+                if not chunk:
+                    break
+                data += chunk
+            finished = os.fstat(fd)
+        except OSError:
+            return "INVALID", {}, ""
+        finally:
+            os.close(fd)
+        try:
+            final = os.stat("published.json", dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return "INVALID", {}, ""
+        stable_fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (not data or len(data) > PUBLISHED_RECEIPT_MAX_BYTES
+                or any(getattr(opened, key) != getattr(finished, key) for key in stable_fields)
+                or (final.st_dev, final.st_ino, stat.S_IFMT(final.st_mode), final.st_size)
+                != (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode), opened.st_size)):
+            return "INVALID", {}, ""
+        def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+            row: dict[str, Any] = {}
+            for key, value in pairs:
+                if key in row:
+                    raise ValueError("duplicate key")
+                row[key] = value
+            return row
+        row = json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicates)
+        if not isinstance(row, dict):
+            return "INVALID", {}, ""
+        return "VALID", row, hashlib.sha256(data).hexdigest()
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+        return "INVALID", {}, ""
+    finally:
+        os.close(dir_fd)
 
 
 def evidence_path(repo_root: Path, issue: str, head_ref: str) -> Path:

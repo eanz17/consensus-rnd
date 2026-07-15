@@ -177,6 +177,7 @@ class ReceiptState:
     head_branch: str
     final_sha: str
     pr_number: int | None
+    receipt_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -233,6 +234,7 @@ class TopologyProvenance:
     equivalence_digest: str = ""
     sentinel_digest: str = ""
     sentinel_url: str = ""
+    publication_receipt_digest: str = ""
 
     def payload(self) -> dict[str, object]:
         value = asdict(self)
@@ -407,6 +409,8 @@ class ControllerTopologyAuthority:
             self._validate_exact(snapshot.local_ref_sha, request.final_sha, "local ref")
             self._validate_exact(snapshot.remote_ref_sha, request.final_sha, "remote ref")
             self._validate_receipt(snapshot.receipt, request, record.pr_number, "PUBLISHED")
+            if snapshot.receipt.receipt_digest != record.publication_receipt_digest:
+                raise ControllerTopologyError("terminal publication receipt digest changed")
             return PublishExactHeadResult(identity.branch, request.final_sha, record.pr_number, record.phase)
         if record.phase is TopologyPhase.WORKTREE_CREATED:
             snapshot = self._port._topology_read_publication(request, worktree)
@@ -491,8 +495,17 @@ class ControllerTopologyAuthority:
             if len(exact) != 1 or exact[0].number != record.pr_number:
                 raise ControllerTopologyError("receipt finalization PR proof changed")
             self._validate_receipt(snapshot.receipt, request, record.pr_number, "PUBLISHED")
-            record = self._adopt_phase(record, TopologyPhase.PUBLICATION_RECEIPT_FINALIZED,
-                                       "publication terminal CAS")
+            first_digest = snapshot.receipt.receipt_digest
+            snapshot = self._continuing_publication(record, request, worktree)
+            exact = self._exact_canonical_prs(snapshot, request)
+            if len(exact) != 1 or exact[0].number != record.pr_number:
+                raise ControllerTopologyError("second receipt finalization PR proof changed")
+            self._validate_receipt(snapshot.receipt, request, record.pr_number, "PUBLISHED")
+            if snapshot.receipt.receipt_digest != first_digest:
+                raise ControllerTopologyError("publication receipt digest changed between reads")
+            terminal = replace(record, publication_receipt_digest=first_digest).exact()
+            record = self._adopt_phase(terminal, TopologyPhase.PUBLICATION_RECEIPT_FINALIZED,
+                                       "publication terminal CAS", prior=record)
         return PublishExactHeadResult(identity.branch, request.final_sha, record.pr_number, record.phase)
 
     def retire_superseded_pr(self, request: RetireSupersededPRRequest) -> RetireSupersededPRResult:
@@ -692,10 +705,11 @@ class ControllerTopologyAuthority:
     def _validate_receipt(receipt: ReceiptState, request: PublishExactHeadRequest,
                           pr_number: int | None, status: str) -> None:
         expected = (request.receipt_id, status, request.identity.issue_number, request.base_branch,
-                    request.identity.branch, request.final_sha, pr_number)
+                    request.identity.branch, request.final_sha, pr_number,
+                    "" if status == "VERIFIED" else receipt.receipt_digest)
         actual = (receipt.receipt_id, receipt.status, receipt.issue_number, receipt.base_branch,
-                  receipt.head_branch, receipt.final_sha, receipt.pr_number)
-        if actual != expected:
+                  receipt.head_branch, receipt.final_sha, receipt.pr_number, receipt.receipt_digest)
+        if actual != expected or (status == "PUBLISHED" and not re.fullmatch(r"[0-9a-f]{64}", receipt.receipt_digest)):
             raise ControllerTopologyError("publish-verification receipt identity mismatch")
 
     @staticmethod

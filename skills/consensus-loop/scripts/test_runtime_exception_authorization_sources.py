@@ -2086,6 +2086,12 @@ class RuntimeExceptionAuthorizationSourceTests(unittest.TestCase):
             self.assertIn(required, section)
         for forbidden_authority in ("command bus", "generic git/GitHub port", "public command"):
             self.assertIn(forbidden_authority, section)
+        for token in (
+            "no-follow regular object", "exact bytes", "exact valid PR/SHA binding",
+            "provenance stores", "terminal reentry requires equality", "fresh #191",
+        ):
+            self.assertIn(token, self.skill)
+            self.assertIn(token, section)
 
 
 if __name__ == "__main__":

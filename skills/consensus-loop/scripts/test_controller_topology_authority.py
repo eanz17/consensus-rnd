@@ -29,6 +29,7 @@ DIFF = "d" * 64
 class FakePort:
     def __init__(self, root: Path) -> None:
         self.repo_root = root
+        self._topology_repository = "owner/repo"
         self.records = {}
         self.calls = []
         self.deny_at: int | None = None
@@ -125,7 +126,7 @@ class FakePort:
     def _topology_post_supersession(self, request, sentinel_digest):
         self.calls.append("EFFECT:comment")
         if self.fail_effect == "comment": raise RuntimeError("comment effect failed")
-        self.sentinels = ("https://example.invalid/comment/1",)
+        self.sentinels = ("https://github.com/owner/repo/pull/10#issuecomment-1",)
         return self.sentinels[0]
 
     def _topology_close_old_pr(self, old):
@@ -489,6 +490,106 @@ class AuthorityTests(unittest.TestCase):
         self.port.sentinels = ()
         with self.assertRaisesRegex(ControllerTopologyError, "uniquely rediscoverable"):
             self.owner.retire_superseded_pr(self.retire)
+
+    def test_retirement_rejects_empty_or_invalid_live_and_stored_sentinel_urls(self):
+        invalid_urls = (
+            "", "https://example.invalid/comment/1", "https://github.com/owner/repo/pull/10",
+            "https://github.com/foreign/repository/pull/10#issuecomment-1",
+            "https://github.com/owner/repo/pull/99#issuecomment-1",
+            "https://github.com/owner/repo/issues/10#issuecomment-1",
+        )
+        for value in invalid_urls:
+            with self.subTest(value=value):
+                port = FakePort(Path(self.temp.name))
+                port.sentinels = (value,)
+                with self.assertRaisesRegex(ControllerTopologyError, "URL is missing or invalid"):
+                    ControllerTopologyAuthority(port).retire_superseded_pr(replace(self.retire, review=port.review))
+                self.assertNotIn("EFFECT:close", port.calls)
+
+        self.owner.retire_superseded_pr(self.retire)
+        record = next(iter(self.port.records.values()))
+        for value in invalid_urls:
+            with self.subTest(stored=value):
+                invalid = replace(record, sentinel_url=value, digest="").exact()
+                self.port.records[invalid.key] = invalid
+                self.port.calls.clear()
+                with self.assertRaisesRegex(ControllerTopologyError, "URL is missing or invalid"):
+                    self.owner.retire_superseded_pr(self.retire)
+                self.assertFalse(any(call.startswith("EFFECT:") for call in self.port.calls))
+
+    def test_retirement_rejects_foreign_live_sentinel_at_every_transaction_phase(self):
+        invalid_urls = (
+            "https://github.com/foreign/repository/pull/10#issuecomment-1",
+            "https://github.com/owner/repo/pull/99#issuecomment-1",
+            "https://github.com/owner/repo/issues/10#issuecomment-1",
+        )
+        for stage in ("adoption", "close", "close-failure-retry", "terminal-reentry"):
+            for value in invalid_urls:
+                with self.subTest(stage=stage, value=value):
+                    port = FakePort(Path(self.temp.name))
+                    owner = ControllerTopologyAuthority(port)
+                    request = replace(self.retire, review=port.review)
+                    if stage == "adoption":
+                        port.deny_boundary = "supersession phase CAS"
+                    elif stage == "close":
+                        port.deny_boundary = "old PR close effect"
+                    elif stage == "close-failure-retry":
+                        port.fail_close = True
+                    try:
+                        owner.retire_superseded_pr(request)
+                    except RuntimeError as error:
+                        expected = {
+                            "adoption": "active-controller lease denied: not-owner",
+                            "close": "active-controller lease denied: not-owner",
+                            "close-failure-retry": "close failed",
+                        }.get(stage)
+                        if str(error) != expected:
+                            raise
+                    port.deny_boundary = None
+                    port.fail_close = False
+                    port.sentinels = (value,)
+                    port.calls.clear()
+                    with self.assertRaisesRegex(ControllerTopologyError, "URL is missing or invalid"):
+                        owner.retire_superseded_pr(request)
+                    self.assertFalse(any(call.startswith("EFFECT:") for call in port.calls))
+
+    def test_canonical_sentinel_adopts_and_retries_without_duplicate_post(self):
+        canonical = "https://github.com/owner/repo/pull/10#issuecomment-7"
+        for stage in ("adoption", "close", "close-failure-retry", "terminal-reentry"):
+            with self.subTest(stage=stage):
+                port = FakePort(Path(self.temp.name))
+                owner = ControllerTopologyAuthority(port)
+                request = replace(self.retire, review=port.review)
+                if stage == "adoption":
+                    port.sentinels = (canonical,)
+                elif stage == "close":
+                    port.deny_boundary = "old PR close effect"
+                elif stage == "close-failure-retry":
+                    port.fail_close = True
+                try:
+                    owner.retire_superseded_pr(request)
+                except RuntimeError as error:
+                    expected = {
+                        "close": "active-controller lease denied: not-owner",
+                        "close-failure-retry": "close failed",
+                    }.get(stage)
+                    if str(error) != expected:
+                        raise
+                port.deny_boundary = None
+                port.fail_close = False
+                port.calls.clear()
+                result = owner.retire_superseded_pr(request)
+                self.assertEqual(TopologyPhase.OLD_PR_CLOSED, result.phase)
+                self.assertNotIn("EFFECT:comment", port.calls)
+
+    def test_zero_sentinel_after_claimed_post_cannot_advance_or_close(self):
+        original = self.port._topology_post_supersession
+        self.port._topology_post_supersession = lambda request, digest: self.port.calls.append("EFFECT:comment")
+        with self.assertRaisesRegex(ControllerTopologyError, "postproof failed"):
+            self.owner.retire_superseded_pr(self.retire)
+        self.assertEqual(TopologyPhase.RETIREMENT_PREPARED, next(iter(self.port.records.values())).phase)
+        self.assertNotIn("EFFECT:close", self.port.calls)
+        self.port._topology_post_supersession = original
 
     def test_publication_terminal_reentry_reproves_live_diff_without_effect_or_cas(self):
         self._created()

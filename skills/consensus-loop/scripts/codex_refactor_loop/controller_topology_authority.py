@@ -26,6 +26,7 @@ _SUPERSESSION_KIND = "controller-topology-supersession"
 _SUPERSESSION_MARKER_RE = re.compile(
     r"<!-- crnd:controller-topology-supersession sentinel_digest=([0-9a-f]{64}) -->"
 )
+_GITHUB_REPOSITORY_RE = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 
 
 class ControllerTopologyError(RuntimeError):
@@ -298,6 +299,9 @@ def controller_topology_branch_is_durable(repo_root: Path, branch: str) -> bool:
 class _TopologyPort(Protocol):
     repo_root: Path
 
+    @property
+    def _topology_repository(self) -> str: ...
+
     def _topology_require_fresh_owner(self, action: str) -> None: ...
     def _topology_read_provenance(self, key: str) -> TopologyProvenance | None: ...
     def _topology_cas_provenance(
@@ -496,7 +500,7 @@ class ControllerTopologyAuthority:
         if record.phase is TopologyPhase.OLD_PR_CLOSED:
             snapshot = self._port._topology_read_retirement(request, record.sentinel_digest)
             self._validate_retirement_snapshot(snapshot, request, allow_closed=True, require_closed=True)
-            self._require_stored_sentinel(snapshot, record)
+            self._require_stored_sentinel(snapshot, record, request)
             return RetireSupersededPRResult(request.old_pr_number, request.replacement_pr_number,
                                             record.phase, record.sentinel_url)
         if record.phase is TopologyPhase.RETIREMENT_PREPARED:
@@ -514,19 +518,20 @@ class ControllerTopologyAuthority:
                 if len(snapshot.sentinel_urls) != 1:
                     raise ControllerTopologyError("supersession sentinel postproof failed")
                 sentinel = snapshot.sentinel_urls[0]
+            self._require_canonical_sentinel_url(sentinel, request)
             proposed = replace(record, sentinel_url=sentinel).exact()
             record = self._adopt_phase(proposed, TopologyPhase.SUPERSESSION_POSTED,
                                        "supersession phase CAS", prior=record)
         if record.phase is TopologyPhase.SUPERSESSION_POSTED:
             snapshot = self._port._topology_read_retirement(request, record.sentinel_digest)
             self._validate_retirement_snapshot(snapshot, request, allow_closed=True)
-            self._require_stored_sentinel(snapshot, record)
+            self._require_stored_sentinel(snapshot, record, request)
             if snapshot.old.state == "OPEN":
                 self._fresh("old PR close effect")
                 self._port._topology_close_old_pr(request.old_pr_number)
                 snapshot = self._port._topology_read_retirement(request, record.sentinel_digest)
             self._validate_retirement_snapshot(snapshot, request, allow_closed=True, require_closed=True)
-            self._require_stored_sentinel(snapshot, record)
+            self._require_stored_sentinel(snapshot, record, request)
             record = self._adopt_phase(record, TopologyPhase.OLD_PR_CLOSED, "old close terminal CAS")
         return RetireSupersededPRResult(request.old_pr_number, request.replacement_pr_number,
                                         record.phase, record.sentinel_url)
@@ -687,14 +692,31 @@ class ControllerTopologyAuthority:
         if body.count(SUPERSESSION_SENTINEL) != 1:
             raise ControllerTopologyError("supersession body must contain exactly one sentinel")
 
-    @staticmethod
-    def _require_stored_sentinel(snapshot: RetirementSnapshot, record: TopologyProvenance) -> None:
-        if len(snapshot.sentinel_urls) != 1 or snapshot.sentinel_urls[0] != record.sentinel_url:
+    def _require_stored_sentinel(
+        self, snapshot: RetirementSnapshot, record: TopologyProvenance, request: RetireSupersededPRRequest,
+    ) -> None:
+        self._require_canonical_sentinel_url(record.sentinel_url, request)
+        if len(snapshot.sentinel_urls) != 1:
+            raise ControllerTopologyError("stored supersession sentinel is not uniquely rediscoverable")
+        self._require_canonical_sentinel_url(snapshot.sentinel_urls[0], request)
+        if snapshot.sentinel_urls[0] != record.sentinel_url:
             raise ControllerTopologyError("stored supersession sentinel is not uniquely rediscoverable")
 
-    @staticmethod
-    def _validate_retirement_snapshot(snapshot: RetirementSnapshot, request: RetireSupersededPRRequest,
-                                      allow_closed: bool, require_closed: bool = False) -> str:
+    def _require_canonical_sentinel_url(self, value: str, request: RetireSupersededPRRequest) -> None:
+        repository = self._port._topology_repository
+        if not isinstance(repository, str) or _GITHUB_REPOSITORY_RE.fullmatch(repository) is None:
+            raise ControllerTopologyError("controller topology repository identity is invalid")
+        expected = re.compile(
+            rf"https://github\.com/{re.escape(repository)}/pull/"
+            rf"{request.old_pr_number}#issuecomment-[1-9][0-9]*"
+        )
+        if not isinstance(value, str) or expected.fullmatch(value) is None:
+            raise ControllerTopologyError("supersession sentinel URL is missing or invalid")
+
+    def _validate_retirement_snapshot(
+        self, snapshot: RetirementSnapshot, request: RetireSupersededPRRequest,
+        allow_closed: bool, require_closed: bool = False,
+    ) -> str:
         old, replacement = snapshot.old, snapshot.replacement
         if old.number != request.old_pr_number or replacement.number != request.replacement_pr_number:
             raise ControllerTopologyError("retirement PR identity changed")
@@ -714,10 +736,11 @@ class ControllerTopologyAuthority:
             raise ControllerTopologyError("canonical review truth input changed")
         if len(snapshot.sentinel_urls) > 1:
             raise ControllerTopologyError("sentinel is duplicate or foreign")
+        for sentinel_url in snapshot.sentinel_urls:
+            self._require_canonical_sentinel_url(sentinel_url, request)
         return hashlib.sha256(f"{old.head_tree_sha}:{old.diff_digest}".encode()).hexdigest()
 
-    @staticmethod
-    def _require_retirement_identity(record: TopologyProvenance, request: RetireSupersededPRRequest) -> None:
+    def _require_retirement_identity(self, record: TopologyProvenance, request: RetireSupersededPRRequest) -> None:
         expected = (request.linked_issue_number, request.old_pr_number, request.replacement_pr_number,
                     request.final_sha, request.base_branch, request.review.evidence_digest)
         actual = (record.issue_number, record.old_pr_number, record.replacement_pr_number, record.final_sha,
@@ -726,6 +749,8 @@ class ControllerTopologyAuthority:
             raise ControllerTopologyError("retirement provenance identity mismatch")
         if not re.fullmatch(r"[0-9a-f]{64}", record.sentinel_digest):
             raise ControllerTopologyError("retirement sentinel digest is invalid")
+        if record.phase in (TopologyPhase.SUPERSESSION_POSTED, TopologyPhase.OLD_PR_CLOSED):
+            self._require_canonical_sentinel_url(record.sentinel_url, request)
 
 
 def _validated_identity(identity: ControllerTopologyIdentity) -> ControllerTopologyIdentity:

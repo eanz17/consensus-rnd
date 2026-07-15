@@ -275,7 +275,7 @@ class ControllerActionsTests(unittest.TestCase):
         request = RetireSupersededPRRequest(9, 41, 77, final_sha, "canonical-integration", review, self.pr_body)
         sentinel_digest = "c" * 64
         marker = f"<!-- crnd:controller-topology-supersession sentinel_digest={sentinel_digest} -->"
-        rows = [{"html_url": "https://example.test/comment/1", "body": f"{marker}\ncontroller-topology-supersession old_pr=9 replacement_pr=41 linked_issue=77"}]
+        rows = [{"html_url": "https://github.com/owner/repo/pull/9#issuecomment-1", "body": f"{marker}\ncontroller-topology-supersession old_pr=9 replacement_pr=41 linked_issue=77"}]
         pr_rows = {
             9: {"number": 9, "state": "OPEN", "labels": [{"name": labels.MANAGED}], "baseRefName": "canonical-integration", "headRefName": "legacy", "headRefOid": "9" * 40, "title": "Old", "body": "Closes #77"},
             41: {"number": 41, "state": "OPEN", "labels": [{"name": labels.MANAGED}], "baseRefName": "canonical-integration", "headRefName": "canonical", "headRefOid": final_sha, "title": "New", "body": "Closes #77"},
@@ -308,7 +308,7 @@ class ControllerActionsTests(unittest.TestCase):
 
         self.assertIsInstance(snapshot.old, PRState)
         self.assertIsInstance(snapshot.replacement, PRState)
-        self.assertEqual(("https://example.test/comment/1",), snapshot.sentinel_urls)
+        self.assertEqual(("https://github.com/owner/repo/pull/9#issuecomment-1",), snapshot.sentinel_urls)
         read_review.assert_called_once_with(41, final_sha, "MERGE")
         self.assertEqual(
             ["api", "repos/owner/repo/issues/9/comments", "--paginate", "--slurp"], gh_calls[0]
@@ -321,6 +321,32 @@ class ControllerActionsTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "PR 41 unavailable"):
                 self.actions._topology_pr_facts(41)
+
+    def test_topology_retirement_comment_parser_rejects_noncanonical_evidence(self) -> None:
+        final_sha = "a" * 40
+        review = ReviewGateProjection("MERGE", 10, final_sha, "review-digest")
+        request = RetireSupersededPRRequest(1, 10, 7, final_sha, "dev", review, self.pr_body)
+        digest = "c" * 64
+        marker = f"<!-- crnd:controller-topology-supersession sentinel_digest={digest} -->"
+        canonical = f"{marker}\ncontroller-topology-supersession old_pr=1 replacement_pr=10 linked_issue=7"
+        good_url = "https://github.com/owner/repo/pull/1#issuecomment-9"
+        cases = {
+            "missing-url": [{"body": canonical}],
+            "empty-url": [{"html_url": "", "body": canonical}],
+            "malformed-url": [{"html_url": "https://github.com/owner/repo/pull/1", "body": canonical}],
+            "substring-overlap": [{"html_url": good_url, "body": f"{marker}\ncontroller-topology-supersession old_pr=10 replacement_pr=10 linked_issue=7"}],
+            "wrong-tuple": [{"html_url": good_url, "body": f"{marker}\ncontroller-topology-supersession old_pr=1 replacement_pr=10 linked_issue=70"}],
+            "malformed-metadata": [{"html_url": good_url, "body": f"{marker}\ncontroller-topology-supersession old_pr=1 replacement_pr=10 linked_issue=7 trailing"}],
+            "wrong-digest": [{"html_url": good_url, "body": f"<!-- crnd:controller-topology-supersession sentinel_digest={'d' * 64} -->\ncontroller-topology-supersession old_pr=1 replacement_pr=10 linked_issue=7"}],
+            "duplicate": [{"html_url": good_url, "body": canonical}, {"html_url": good_url.replace("-9", "-10"), "body": canonical}],
+        }
+        for label, rows in cases.items():
+            with self.subTest(label=label), self.assertRaisesRegex(RuntimeError, "supersession"):
+                self.actions._topology_supersession_comment_urls(rows, request, digest)
+
+        self.assertEqual((good_url,), self.actions._topology_supersession_comment_urls(
+            [{"html_url": good_url, "body": canonical}], request, digest
+        ))
 
     def test_record_recent_pr_merge_writes_rolling_artifact(self) -> None:
         facts = {

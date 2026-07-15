@@ -158,6 +158,10 @@ class ControllerActions:
     def repo_root(self) -> Path:
         return self.ctx.repo_root
 
+    @property
+    def _topology_repository(self) -> str:
+        return self.ctx.gh_repo_slug
+
     def _topology_authority(self) -> ControllerTopologyAuthority:
         return ControllerTopologyAuthority(self)
 
@@ -413,14 +417,7 @@ class ControllerActions:
         if comments.returncode != 0:
             raise RuntimeError("controller topology supersession comments unavailable")
         rows = _flatten_gh_pages(json.loads(comments.stdout or "[]"))
-        marker = supersession_marker(sentinel_digest) if sentinel_digest else ""
-        sentinel_urls = tuple(
-            str(row.get("html_url") or "") for row in rows
-            if marker and str(row.get("body") or "").count(marker) == 1
-            and f"old_pr={request.old_pr_number}" in str(row.get("body") or "")
-            and f"replacement_pr={request.replacement_pr_number}" in str(row.get("body") or "")
-            and f"linked_issue={request.linked_issue_number}" in str(row.get("body") or "")
-        )
+        sentinel_urls = self._topology_supersession_comment_urls(rows, request, sentinel_digest)
         review = self._topology_review_projection(
             request.replacement_pr_number,
             request.final_sha,
@@ -431,6 +428,50 @@ class ControllerActions:
             self._topology_pr_facts(request.replacement_pr_number),
             self._topology_issue_state(request.linked_issue_number), review, sentinel_urls,
         )
+
+    def _topology_supersession_comment_urls(
+        self,
+        rows: Sequence[Mapping[str, Any]],
+        request: RetireSupersededPRRequest,
+        sentinel_digest: str,
+    ) -> tuple[str, ...]:
+        if not sentinel_digest:
+            return ()
+        expected_marker = supersession_marker(sentinel_digest)
+        marker_prefix = expected_marker.partition("sentinel_digest=")[0]
+        metadata_re = re.compile(
+            r"controller-topology-supersession old_pr=([1-9][0-9]*) "
+            r"replacement_pr=([1-9][0-9]*) linked_issue=([1-9][0-9]*)"
+        )
+        url_re = re.compile(
+            rf"https://github\.com/{re.escape(self.ctx.gh_repo_slug)}/pull/"
+            rf"{request.old_pr_number}#issuecomment-[1-9][0-9]*"
+        )
+        matches: list[str] = []
+        for row in rows:
+            body = row.get("body")
+            if not isinstance(body, str):
+                body = ""
+            if marker_prefix not in body:
+                continue
+            marker_lines = [line for line in body.splitlines() if line.startswith(marker_prefix)]
+            metadata_lines = [line for line in body.splitlines() if line.startswith("controller-topology-supersession")]
+            if marker_lines != [expected_marker] or len(metadata_lines) != 1:
+                raise RuntimeError("controller topology supersession metadata is malformed or mismatched")
+            metadata = metadata_re.fullmatch(metadata_lines[0])
+            if metadata is None:
+                raise RuntimeError("controller topology supersession metadata is malformed or mismatched")
+            actual = tuple(int(value) for value in metadata.groups())
+            expected = (request.old_pr_number, request.replacement_pr_number, request.linked_issue_number)
+            if actual != expected:
+                raise RuntimeError("controller topology supersession metadata tuple mismatched")
+            url = row.get("html_url")
+            if not isinstance(url, str) or url_re.fullmatch(url) is None:
+                raise RuntimeError("controller topology supersession comment URL is missing or invalid")
+            matches.append(url)
+        if len(matches) > 1:
+            raise RuntimeError("controller topology supersession evidence is duplicate")
+        return tuple(matches)
 
     def _topology_review_projection(
         self,

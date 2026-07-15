@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import stat
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 from enum import Enum
@@ -260,7 +261,11 @@ def _iter_exact_publications(repo_root: Path):
         return
     worktrees = (repo_root / ".worktrees").resolve()
     for path in state_dir.glob("publication__*.json"):
-        if not path.is_file():
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise ControllerTopologyError("publication provenance entry is unavailable") from exc
+        if not stat.S_ISREG(mode):
             raise ControllerTopologyError("publication provenance is not a regular file")
         try:
             row = json.loads(path.read_text(encoding="utf-8"))
@@ -348,12 +353,13 @@ class ControllerTopologyAuthority:
             record = self._reread_exact(prepared)
         self._require_create_identity(record, request, worktree)
         if record.phase is TopologyPhase.WORKTREE_CREATED:
-            self._require_complete_worktree(live, branch, request.base_sha)
+            self._require_create_complete(live, branch, request.base_sha)
             return CreateCompliantWorktreeResult(branch, worktree, request.base_sha, record.phase)
         if record.phase is not TopologyPhase.CREATE_PREPARED:
             raise ControllerTopologyError("create cannot resume from publication phase")
 
         live = self._port._topology_read_worktree(branch, worktree, request.base_ref, "origin")
+        self._require_no_create_collision(live)
         complete = _is_complete_worktree(live, branch, request.base_sha)
         branch_only = _is_branch_only(live, request.base_sha)
         if not complete:
@@ -365,10 +371,22 @@ class ControllerTopologyAuthority:
             else:
                 raise ControllerTopologyError("create partial state is not exactly adoptable")
             live = self._port._topology_read_worktree(branch, worktree, request.base_ref, "origin")
-        self._require_complete_worktree(live, branch, request.base_sha)
+        self._require_create_complete(live, branch, request.base_sha)
+        live = self._port._topology_read_worktree(branch, worktree, request.base_ref, "origin")
+        self._require_create_complete(live, branch, request.base_sha)
         advanced = self._advance(record, TopologyPhase.WORKTREE_CREATED)
         self._cas(record, advanced, "created phase CAS")
         return CreateCompliantWorktreeResult(branch, worktree, request.base_sha, advanced.phase)
+
+    @staticmethod
+    def _require_no_create_collision(live: WorktreeState) -> None:
+        if live.remote_ref_sha is not None or live.open_pr_numbers:
+            raise ControllerTopologyError("create remote ref or open PR collision")
+
+    @classmethod
+    def _require_create_complete(cls, live: WorktreeState, branch: str, sha: str) -> None:
+        cls._require_no_create_collision(live)
+        cls._require_complete_worktree(live, branch, sha)
 
     def publish_exact_head(self, request: PublishExactHeadRequest) -> PublishExactHeadResult:
         identity = _validated_identity(request.identity)
@@ -794,16 +812,19 @@ def _sentinel_digest(request: RetireSupersededPRRequest, equivalence_digest: str
 
 
 def _is_wholly_absent(live: WorktreeState) -> bool:
-    return live.local_ref_sha is None and not live.worktree_registered and not live.foreign_attachment
+    return (live.local_ref_sha is None and live.remote_ref_sha is None and not live.worktree_registered
+            and not live.foreign_attachment and not live.open_pr_numbers)
 
 
 def _is_branch_only(live: WorktreeState, sha: str) -> bool:
-    return live.local_ref_sha == sha and not live.worktree_registered and not live.foreign_attachment
+    return (live.local_ref_sha == sha and live.remote_ref_sha is None and not live.worktree_registered
+            and not live.foreign_attachment and not live.open_pr_numbers)
 
 
 def _is_complete_worktree(live: WorktreeState, branch: str, sha: str) -> bool:
     return (live.local_ref_sha == sha and live.worktree_registered and live.worktree_branch == branch
-            and live.worktree_head_sha == sha and live.worktree_clean and not live.foreign_attachment)
+            and live.worktree_head_sha == sha and live.worktree_clean and not live.foreign_attachment
+            and live.remote_ref_sha is None and not live.open_pr_numbers)
 
 
 def _has_create_collision(live: WorktreeState) -> bool:

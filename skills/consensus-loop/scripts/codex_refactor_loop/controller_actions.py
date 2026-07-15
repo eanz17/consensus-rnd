@@ -77,6 +77,7 @@ from .publish_verification import (
     mark_published as mark_publish_verification_published,
     prepare_or_schedule as prepare_publish_verification,
     record_job_retry as record_publish_verification_retry,
+    validate_published_receipt,
 )
 from .release.publisher import ReleasePublisher
 from .release.required_checks import ReleaseRequiredChecksProjection, required_release_checks
@@ -373,14 +374,17 @@ class ControllerActions:
     def _topology_read_publication(self, request: PublishExactHeadRequest, worktree: Path) -> PublicationSnapshot:
         canonical = tuple(self._topology_pr_facts(number) for number in self._topology_open_pr_numbers(request.identity.branch))
         legacy = self._topology_pr_facts(request.legacy_pr_number)
-        request_row = read_json(Path(request.receipt_id) / "request.json", {})
-        result_row = read_json(Path(request.receipt_id) / "result.json", {})
-        published_row = read_json(Path(request.receipt_id) / "published.json", {})
-        receipt_status = "PUBLISHED" if published_row else ("VERIFIED" if result_row.get("status") == "VERIFIED" else "")
+        receipt_path = Path(request.receipt_id)
+        receipt_git = lambda args: self.git(args, check=False)
+        published = validate_published_receipt(
+            receipt_path, env=self.ctx.env_for_subprocess(), git_runner=receipt_git,
+        )
+        receipt_status = "PUBLISHED" if published.ok else ("VERIFIED" if published.status == "verified" else "")
+        issue_number = int(published.issue) if published.issue.isdigit() else 0
         receipt = ReceiptState(
-            request.receipt_id, receipt_status, int(request_row.get("issue") or 0), request.base_branch,
-            str(request_row.get("head_ref") or ""), str(request_row.get("verified_sha") or ""),
-            int(published_row["pr_number"]) if str(published_row.get("pr_number") or "").isdigit() else None,
+            request.receipt_id, receipt_status, issue_number, published.base_branch,
+            published.head_ref, published.verified_sha,
+            published.pr_number if published.ok else None,
         )
         worktree_state = self._topology_read_worktree(
             request.identity.branch, worktree, request.base_branch, request.configured_remote
@@ -1916,6 +1920,7 @@ class ControllerActions:
             issue=issue_target,
             action=str(action.get("controller_action") or "publish_implementation_output"),
             head_ref=head_ref,
+            base_branch=self.review_base_branch,
             candidate_sha=head.stdout.strip(),
             env=self.ctx.env_for_subprocess(),
             git_runner=lambda args: self._git_in(worktree, args, check=False),

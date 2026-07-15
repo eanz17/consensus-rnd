@@ -45,6 +45,7 @@ class PublishVerificationTests(unittest.TestCase):
             "issue": "77",
             "action": "publish_implementation_output",
             "head_ref": "refactor/iter77-issue-77",
+            "base_branch": "canonical-integration",
             "candidate_sha": "a" * 40,
             "env": self.env,
         }
@@ -320,6 +321,7 @@ class PublishVerificationTests(unittest.TestCase):
         request = json.loads((result.job_dir / "request.json").read_text(encoding="utf-8"))
         running = {
             "schema": "PublishVerificationResult",
+            "version": publish_verification.VERIFY_VERSION,
             "status": "RUNNING",
             "reason": "running",
             "job_key": result.job_key,
@@ -381,6 +383,77 @@ class PublishVerificationTests(unittest.TestCase):
         self.assertEqual(414, payload["pr_number"])
         self.assertEqual("a" * 40, payload["remote_oid"])
         self.assertFalse((result.job_dir / "retry.json").exists())
+
+    def test_verified_and_published_receipt_tampering_fails_closed(self) -> None:
+        result = self._write_verified_receipt()
+        request_path = result.job_dir / "request.json"
+        result_path = result.job_dir / "result.json"
+        original_request = json.loads(request_path.read_text(encoding="utf-8"))
+        original_result = json.loads(result_path.read_text(encoding="utf-8"))
+        mutations = {
+            "request-extra": (request_path, {**original_request, "foreign_extra": True}),
+            "request-missing": (request_path, {key: value for key, value in original_request.items() if key != "action"}),
+            "request-schema": (request_path, {**original_request, "schema": "ForeignRequest"}),
+            "job": (request_path, {**original_request, "job_key": "0" * 32}),
+            "result-extra": (result_path, {**original_result, "foreign_extra": True}),
+            "result-missing": (result_path, {key: value for key, value in original_result.items() if key != "completed_at_epoch"}),
+            "digest": (result_path, {**original_result, "command_digest": "0" * 64}),
+            "sha": (result_path, {**original_result, "tested_sha": "b" * 40}),
+            "private-ref": (result_path, {**original_result, "private_ref": "refs/foreign"}),
+            "receipts": (result_path, {**original_result, "commands": []}),
+        }
+        for label, (path, row) in mutations.items():
+            with self.subTest(label=label):
+                request_path.write_text(json.dumps(original_request), encoding="utf-8")
+                result_path.write_text(json.dumps(original_result), encoding="utf-8")
+                path.write_text(json.dumps(row), encoding="utf-8")
+                validated = publish_verification.validate_verified_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        request_path.write_text(json.dumps(original_request), encoding="utf-8")
+        result_path.write_text(json.dumps(original_result), encoding="utf-8")
+
+        invalid_timestamps = (None, False, True, "1", 0, -1, float("nan"), float("inf"), float("-inf"))
+        for value in invalid_timestamps:
+            with self.subTest(completed_at_epoch=value):
+                result_path.write_text(
+                    json.dumps({**original_result, "completed_at_epoch": value}), encoding="utf-8",
+                )
+                validated = publish_verification.validate_verified_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        result_path.write_text(json.dumps(original_result), encoding="utf-8")
+
+        publish_verification.mark_published(result.job_dir, pr_number=414, remote_oid="a" * 40)
+        published_path = result.job_dir / "published.json"
+        original_published = json.loads(published_path.read_text(encoding="utf-8"))
+        for label, row in {
+            "schema": {**original_published, "schema": "ForeignPublished"},
+            "foreign-sha": {**original_published, "remote_oid": "b" * 40},
+            "foreign-pr": {**original_published, "pr_number": 0},
+            "extra-binding": {**original_published, "job_key": result.job_key},
+        }.items():
+            with self.subTest(published=label):
+                published_path.write_text(json.dumps(row), encoding="utf-8")
+                validated = publish_verification.validate_published_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        for value in invalid_timestamps:
+            with self.subTest(published_at_epoch=value):
+                published_path.write_text(
+                    json.dumps({**original_published, "published_at_epoch": value}), encoding="utf-8",
+                )
+                validated = publish_verification.validate_published_receipt(
+                    result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+                )
+                self.assertFalse(validated.ok)
+        published_path.write_text("{", encoding="utf-8")
+        self.assertFalse(publish_verification.validate_published_receipt(
+            result.job_dir, env=self.env, git_runner=self._private_ref_git("a" * 40),
+        ).ok)
 
     def test_failed_receipts_use_per_job_retry_schedule_then_quarantine(self) -> None:
         result = self._prepared_job_without_child()
@@ -461,6 +534,7 @@ class PublishVerificationTests(unittest.TestCase):
         request = json.loads((result.job_dir / "request.json").read_text(encoding="utf-8"))
         payload = {
             "schema": "PublishVerificationResult",
+            "version": publish_verification.VERIFY_VERSION,
             "status": "VERIFIED",
             "reason": "verified",
             "job_key": result.job_key,
@@ -472,6 +546,7 @@ class PublishVerificationTests(unittest.TestCase):
             "checkpoint_hashes": request["checkpoint_hashes"],
             "private_ref": request["private_ref"],
             "private_ref_oid": "a" * 40,
+            "completed_at_epoch": 1_001_800.0,
             "commands": [
                 {
                     "name": "BUILD_CMD",

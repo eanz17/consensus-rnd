@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from dataclasses import replace
 from datetime import date
 from pathlib import Path
@@ -17,6 +18,7 @@ from codex_refactor_loop.controller_topology_authority import (
     CreateCompliantWorktreeRequest, PRState, PublicationSnapshot, PublishExactHeadRequest,
     ReceiptState, RetirementSnapshot, RetireSupersededPRRequest, ReviewGateProjection,
     SUPERSESSION_SENTINEL, TopologyPhase, WorktreeState,
+    TopologyProvenance, controller_topology_branch_is_durable, read_controller_topology_identity,
     parse_legacy_implementation_head_evidence,
 )
 
@@ -223,6 +225,73 @@ class AuthorityTests(unittest.TestCase):
         result = self.owner.create_compliant_worktree(self.create)
         self.assertEqual(TopologyPhase.WORKTREE_CREATED, result.phase)
         self.assertEqual(1, self.port.calls.count("EFFECT:create"))
+
+    def test_create_revalidates_remote_and_open_pr_collisions_at_every_boundary(self):
+        collision_rows = (
+            ("remote", {"remote_ref_sha": BASE}),
+            ("open-pr", {"open_pr_numbers": (77,)}),
+        )
+        for label, fields in collision_rows:
+            with self.subTest(boundary="after-prepare", collision=label):
+                port = FakePort(Path(self.temp.name)); owner = ControllerTopologyAuthority(port)
+                port.deny_at = 2
+                with self.assertRaises(RuntimeError): owner.create_compliant_worktree(self.create)
+                port.deny_at = None
+                port.worktree = replace(port.worktree, **fields)
+                before = len(port.calls)
+                with self.assertRaises(ControllerTopologyError): owner.create_compliant_worktree(self.create)
+                self.assertEqual(TopologyPhase.CREATE_PREPARED, next(iter(port.records.values())).phase)
+                self.assertFalse(any(call.startswith("EFFECT:") or call.startswith("CAS:") for call in port.calls[before:]))
+                port.worktree = replace(port.worktree, remote_ref_sha=None, open_pr_numbers=())
+                self.assertEqual(TopologyPhase.WORKTREE_CREATED, owner.create_compliant_worktree(self.create).phase)
+
+            with self.subTest(boundary="after-effect", collision=label):
+                port = FakePort(Path(self.temp.name)); owner = ControllerTopologyAuthority(port)
+                original = port._topology_create_worktree
+                def create_then_collide(branch, path, sha, original=original, fields=fields):
+                    original(branch, path, sha)
+                    port.worktree = replace(port.worktree, **fields)
+                port._topology_create_worktree = create_then_collide
+                with self.assertRaises(ControllerTopologyError): owner.create_compliant_worktree(self.create)
+                self.assertEqual(TopologyPhase.CREATE_PREPARED, next(iter(port.records.values())).phase)
+                self.assertNotIn("CAS:WORKTREE_CREATED", port.calls)
+                port.worktree = replace(port.worktree, remote_ref_sha=None, open_pr_numbers=())
+                self.assertEqual(TopologyPhase.WORKTREE_CREATED, owner.create_compliant_worktree(self.create).phase)
+                self.assertEqual(1, port.calls.count("EFFECT:create"))
+
+            with self.subTest(boundary="terminal", collision=label):
+                port = FakePort(Path(self.temp.name)); owner = ControllerTopologyAuthority(port)
+                owner.create_compliant_worktree(self.create)
+                port.worktree = replace(port.worktree, **fields)
+                before = len(port.calls)
+                with self.assertRaises(ControllerTopologyError): owner.create_compliant_worktree(self.create)
+                self.assertFalse(any(call.startswith("EFFECT:") or call.startswith("CAS:") for call in port.calls[before:]))
+                port.worktree = replace(port.worktree, remote_ref_sha=None, open_pr_numbers=())
+                self.assertEqual(TopologyPhase.WORKTREE_CREATED, owner.create_compliant_worktree(self.create).phase)
+
+    def test_publication_membership_rejects_external_symlink_and_non_regular_entries(self):
+        root = Path(self.temp.name)
+        branch = self.identity.branch
+        worktree = root / ".worktrees" / branch.replace("/", "__")
+        record = TopologyProvenance(
+            f"publication:{branch}", TopologyPhase.WORKTREE_CREATED, 2, "", 2737,
+            "controller-topology", "refactor", "2026-07-15", branch, str(worktree),
+            "origin/dev", BASE,
+        ).exact()
+        state = root / ".refactor-loop" / "state" / "controller-topology"
+        state.mkdir(parents=True)
+        name = f"publication__{branch.replace('/', '__')}.json"
+        outside = root / "outside.json"
+        outside.write_text(json.dumps({**record.payload(), "digest": record.digest}), encoding="utf-8")
+        (state / name).symlink_to(outside)
+        for reader in (lambda: read_controller_topology_identity(root, 2737),
+                       lambda: controller_topology_branch_is_durable(root, branch)):
+            with self.assertRaisesRegex(ControllerTopologyError, "regular file"):
+                reader()
+        (state / name).unlink()
+        (state / name).mkdir()
+        with self.assertRaisesRegex(ControllerTopologyError, "regular file"):
+            controller_topology_branch_is_durable(root, branch)
 
     def test_publish_runs_exact_locked_sequence_and_receipt_precedes_return(self):
         self._created()

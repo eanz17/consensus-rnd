@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import time
@@ -21,8 +22,28 @@ VERIFY_COMMANDS = ("BUILD_CMD", "TEST_CMD")
 RETRY_DELAYS_SECONDS = (1800, 7200, 28800)
 REQUEST_SCHEMA = "PublishVerificationRequest"
 RESULT_SCHEMA = "PublishVerificationResult"
+REQUEST_KEYS = frozenset({
+    "schema", "version", "job_key", "issue", "action", "head_ref", "base_branch",
+    "worktree", "candidate_sha", "verified_sha", "gate_id", "command_digest",
+    "checkpoint_hashes", "commands", "host_env_locator", "private_ref",
+})
+RESULT_BASE_KEYS = frozenset({
+    "schema", "version", "status", "reason", "job_key", "verified_sha", "gate_id",
+    "command_digest", "checkpoint_hashes", "private_ref", "commands",
+})
+RESULT_MINIMAL_FAILED_KEYS = frozenset({"schema", "version", "status", "reason", "job_key", "verified_sha"})
+COMMAND_RECEIPT_KEYS = frozenset({"name", "command_sha256", "exit", "log", "exit_marker"})
 
 GitRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+
+def _is_writer_timestamp(value: object) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
 
 
 @dataclass(frozen=True)
@@ -45,10 +66,33 @@ class PublishVerificationReceiptValidation:
     job_dir: Path
     job_key: str
     verified_sha: str = ""
+    issue: str = ""
+    base_branch: str = ""
+    head_ref: str = ""
+    private_ref: str = ""
 
     @property
     def ok(self) -> bool:
         return self.status == "verified"
+
+
+@dataclass(frozen=True)
+class PublishVerificationPublishedValidation:
+    status: str
+    reason: str
+    job_dir: Path
+    job_key: str
+    verified_sha: str = ""
+    pr_number: int | None = None
+    remote_oid: str = ""
+    issue: str = ""
+    base_branch: str = ""
+    head_ref: str = ""
+    private_ref: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "published"
 
 
 @dataclass(frozen=True)
@@ -88,6 +132,7 @@ def prepare_or_schedule(
     issue: str,
     action: str,
     head_ref: str,
+    base_branch: str,
     candidate_sha: str,
     env: Mapping[str, str],
     git_runner: GitRunner | None = None,
@@ -101,6 +146,7 @@ def prepare_or_schedule(
         issue=issue,
         action=action,
         head_ref=head_ref,
+        base_branch=base_branch,
         candidate_sha=candidate_sha,
         env=env,
     )
@@ -177,6 +223,7 @@ def build_request(
     issue: str,
     action: str,
     head_ref: str,
+    base_branch: str,
     candidate_sha: str,
     env: Mapping[str, str],
 ) -> dict[str, Any]:
@@ -189,6 +236,7 @@ def build_request(
         "issue": str(issue),
         "action": str(action),
         "head_ref": str(head_ref),
+        "base_branch": str(base_branch),
         "candidate_sha": str(candidate_sha),
         "gate_id": gate_id,
         "command_digest": digest,
@@ -201,6 +249,7 @@ def build_request(
         "issue": str(issue),
         "action": str(action),
         "head_ref": str(head_ref),
+        "base_branch": str(base_branch),
         "worktree": worktree_rel,
         "candidate_sha": str(candidate_sha),
         "verified_sha": str(candidate_sha),
@@ -303,18 +352,31 @@ def validate_verified_receipt(
     result_path = job_dir / "result.json"
     result = _read_json(result_path, {})
     job_key = str(request.get("job_key") or "")
-    if not isinstance(request, dict) or request.get("schema") != REQUEST_SCHEMA or not job_key:
+    if (not isinstance(request, dict) or set(request) != REQUEST_KEYS
+            or request.get("schema") != REQUEST_SCHEMA or not job_key):
         return PublishVerificationReceiptValidation("failed", "request-invalid", job_dir, job_key)
+    key_payload = {
+        "issue": request.get("issue"), "action": request.get("action"),
+        "head_ref": request.get("head_ref"), "base_branch": request.get("base_branch"),
+        "candidate_sha": request.get("candidate_sha"),
+        "gate_id": request.get("gate_id"), "command_digest": request.get("command_digest"),
+    }
+    expected_job_key = string_digest(json.dumps(key_payload, sort_keys=True, separators=(",", ":")))[:32]
+    if job_key != expected_job_key or job_dir.name != job_key:
+        return PublishVerificationReceiptValidation("failed", "job-key-mismatch", job_dir, job_key)
     if (job_dir / "superseded.json").exists():
         return PublishVerificationReceiptValidation("failed", "superseded", job_dir, job_key)
     if not result_path.exists():
         return PublishVerificationReceiptValidation("pending", "result-missing", job_dir, job_key)
-    if not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA:
+    if (not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA
+            or not _result_keys_are_canonical(result)):
         return PublishVerificationReceiptValidation("failed", "result-invalid", job_dir, job_key)
     if result.get("status") == "RUNNING":
         return PublishVerificationReceiptValidation("pending", "running", job_dir, job_key)
     if result.get("status") != "VERIFIED":
         return PublishVerificationReceiptValidation("failed", str(result.get("reason") or "not-verified"), job_dir, job_key)
+    if not _is_writer_timestamp(result.get("completed_at_epoch")):
+        return PublishVerificationReceiptValidation("failed", "completed-at-invalid", job_dir, job_key)
     for key in ("job_key", "verified_sha", "gate_id", "command_digest", "checkpoint_hashes", "private_ref"):
         if result.get(key) != request.get(key):
             return PublishVerificationReceiptValidation("failed", f"{key}-mismatch", job_dir, job_key)
@@ -333,7 +395,52 @@ def validate_verified_receipt(
     private_oid = _private_ref_oid(git, str(request["private_ref"]))
     if private_oid != candidate_sha or result.get("private_ref_oid") != private_oid:
         return PublishVerificationReceiptValidation("failed", "private-ref-mismatch", job_dir, job_key)
-    return PublishVerificationReceiptValidation("verified", "verified", job_dir, job_key, str(request["verified_sha"]))
+    issue = request.get("issue")
+    base_branch = request.get("base_branch")
+    head_ref = request.get("head_ref")
+    private_ref = request.get("private_ref")
+    if (not isinstance(issue, str) or not issue or not isinstance(base_branch, str) or not base_branch
+            or not isinstance(head_ref, str) or not head_ref or not isinstance(private_ref, str) or not private_ref):
+        return PublishVerificationReceiptValidation("failed", "request-identity-invalid", job_dir, job_key)
+    return PublishVerificationReceiptValidation(
+        "verified", "verified", job_dir, job_key, str(request["verified_sha"]),
+        issue, base_branch, head_ref, private_ref,
+    )
+
+
+def validate_published_receipt(
+    job_dir: Path,
+    *,
+    env: Mapping[str, str],
+    git_runner: GitRunner | None = None,
+) -> PublishVerificationPublishedValidation:
+    verified = validate_verified_receipt(job_dir, env=env, git_runner=git_runner)
+    if not verified.ok:
+        return PublishVerificationPublishedValidation(
+            "failed", f"verified-receipt-{verified.reason}", verified.job_dir, verified.job_key,
+        )
+    path = verified.job_dir / "published.json"
+    row = _read_json(path, {})
+    if not path.exists():
+        return PublishVerificationPublishedValidation(
+            "verified", "published-missing", verified.job_dir, verified.job_key,
+            verified.verified_sha, None, "", verified.issue, verified.base_branch,
+            verified.head_ref, verified.private_ref,
+        )
+    expected_keys = {"schema", "pr_number", "remote_oid", "published_at_epoch"}
+    if not isinstance(row, dict) or set(row) != expected_keys or row.get("schema") != "PublishVerificationPublished":
+        return PublishVerificationPublishedValidation("failed", "published-invalid", verified.job_dir, verified.job_key)
+    pr_number = row.get("pr_number")
+    published_at = row.get("published_at_epoch")
+    if (isinstance(pr_number, bool) or not isinstance(pr_number, int) or pr_number <= 0
+            or not _is_writer_timestamp(published_at)
+            or row.get("remote_oid") != verified.verified_sha):
+        return PublishVerificationPublishedValidation("failed", "published-binding-invalid", verified.job_dir, verified.job_key)
+    return PublishVerificationPublishedValidation(
+        "published", "published", verified.job_dir, verified.job_key,
+        verified.verified_sha, pr_number, str(row["remote_oid"]), verified.issue,
+        verified.base_branch, verified.head_ref, verified.private_ref,
+    )
 
 
 def record_failed_receipt_retry(job_dir: Path, *, now: float | None = None) -> PublishVerificationRetryStatus:
@@ -525,11 +632,35 @@ def _command_receipts_valid(commands: object, checkpoint_hashes: object) -> bool
     by_name = {item.get("name"): item for item in commands if isinstance(item, dict)}
     for name in VERIFY_COMMANDS:
         item = by_name.get(name)
-        if not isinstance(item, dict) or item.get("exit") != 0 or item.get("exit_marker") is not True:
+        if (not isinstance(item, dict) or set(item) != COMMAND_RECEIPT_KEYS
+                or item.get("exit") != 0 or item.get("exit_marker") is not True):
             return False
         if item.get("command_sha256") != checkpoint_hashes.get(name):
             return False
     return True
+
+
+def _result_keys_are_canonical(result: Mapping[str, Any]) -> bool:
+    status = result.get("status")
+    keys = frozenset(result)
+    if status == "VERIFIED":
+        return keys == RESULT_BASE_KEYS | {
+            "tested_sha", "post_tested_sha", "private_ref_oid", "completed_at_epoch",
+        }
+    if status == "RUNNING":
+        return keys in {
+            RESULT_BASE_KEYS,
+            RESULT_BASE_KEYS | {"tested_sha"},
+            RESULT_BASE_KEYS | {"tested_sha", "post_tested_sha"},
+        }
+    if status == "FAILED":
+        return keys == RESULT_MINIMAL_FAILED_KEYS or keys in {
+            RESULT_BASE_KEYS,
+            RESULT_BASE_KEYS | {"tested_sha"},
+            RESULT_BASE_KEYS | {"tested_sha", "post_tested_sha"},
+            RESULT_BASE_KEYS | {"tested_sha", "post_tested_sha", "private_ref_oid"},
+        }
+    return False
 
 
 def _env_for_child(repo_root: Path, request: Mapping[str, Any]) -> dict[str, str]:
@@ -645,4 +776,5 @@ __all__ = [
     "run_one_publish_ratchet",
     "string_digest",
     "validate_verified_receipt",
+    "validate_published_receipt",
 ]

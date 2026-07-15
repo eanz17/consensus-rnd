@@ -59,7 +59,9 @@ from codex_refactor_loop.issue_decomposition import issue_decomposition_plan_fil
 from codex_refactor_loop.issue_decomposition import issue_decomposition_child_fingerprint
 from codex_refactor_loop.managed_work_snapshot import ManagedWorkSnapshotItem, ManagedWorkSnapshotResult
 from codex_refactor_loop.prompt_contracts import GITHUB_POST_RULES_CONTRACT_TOKEN
-from codex_refactor_loop.publish_verification import PublishVerificationJobResult
+from codex_refactor_loop.publish_verification import (
+    PublishVerificationJobResult, PublishVerificationPublishedValidation,
+)
 from codex_refactor_loop.release.publisher import ReleasePublishResult
 from codex_refactor_loop.secondary_mutation_backoff import record_secondary_mutation_backoff
 from codex_refactor_loop.wakeup_plan import harness_spawn_intent_actions
@@ -215,10 +217,6 @@ class ControllerActionsTests(unittest.TestCase):
         worktree.mkdir(parents=True, exist_ok=True)
         receipt = self.tmp / ".refactor-loop" / "state" / "publish-verification" / "jobs" / "adapter"
         receipt.mkdir(parents=True)
-        (receipt / "request.json").write_text(json.dumps({
-            "issue": 77, "head_ref": identity.branch, "verified_sha": final_sha,
-        }), encoding="utf-8")
-        (receipt / "result.json").write_text(json.dumps({"status": "VERIFIED"}), encoding="utf-8")
         request = PublishExactHeadRequest(identity, final_sha, "upstream", "canonical-integration", 9, str(receipt), "", "")
         worktree_state = WorktreeState("c" * 40, final_sha, final_sha, True, identity.branch, final_sha, True, False, (41,))
         pr_rows = {
@@ -250,9 +248,14 @@ class ControllerActionsTests(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0, "", "")
             raise AssertionError(f"unexpected git call: {argv}")
 
+        pending = PublishVerificationPublishedValidation(
+            "verified", "published-missing", receipt, "adapter", final_sha, None, "", "77",
+            "canonical-integration", identity.branch, "refs/consensus/publish/adapter",
+        )
         with mock.patch.object(self.actions, "gh", side_effect=fake_gh), mock.patch.object(
             self.actions, "git", side_effect=fake_git
-        ), mock.patch.object(self.actions, "_topology_read_worktree", return_value=worktree_state) as read_worktree:
+        ), mock.patch.object(self.actions, "_topology_read_worktree", return_value=worktree_state) as read_worktree, \
+                mock.patch("codex_refactor_loop.controller_actions.validate_published_receipt", return_value=pending):
             snapshot = self.actions._topology_read_publication(request, worktree)
 
         self.assertEqual((41,), tuple(pr.number for pr in snapshot.canonical_prs))

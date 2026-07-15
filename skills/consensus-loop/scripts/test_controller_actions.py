@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 import time
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Mapping, Sequence
 from unittest import mock
@@ -34,7 +34,8 @@ from codex_refactor_loop.controller_actions import (
     ISSUE_LABELS_REMOVE,
 )
 from codex_refactor_loop.controller_topology_authority import (
-    PublishExactHeadResult, TopologyPhase, TopologyProvenance,
+    ControllerTopologyIdentity, PRState, PublishExactHeadRequest, PublishExactHeadResult,
+    RetireSupersededPRRequest, ReviewGateProjection, TopologyPhase, TopologyProvenance, WorktreeState,
     controller_topology_branch_is_durable, read_controller_topology_identity,
 )
 
@@ -158,6 +159,168 @@ class ControllerActionsTests(unittest.TestCase):
         path.write_text(json.dumps(row), encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "digest"):
             self.actions._topology_read_provenance(record.key)
+
+    def test_topology_pr_facts_maps_live_projection_and_exact_commands(self) -> None:
+        head_sha = "a" * 40
+        tree_sha = "b" * 40
+        body = "Closes #77\nAlso closes #12.\n"
+        row = {
+            "number": 41, "state": "OPEN", "labels": [{"name": labels.MANAGED}],
+            "baseRefName": "canonical-integration", "headRefName": "refactor/2026-07-15_issue-77",
+            "headRefOid": head_sha, "title": "Implement issue 77", "body": body,
+        }
+        gh_calls: list[list[str]] = []
+        git_calls: list[list[str]] = []
+
+        def fake_gh(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            gh_calls.append(list(args))
+            return subprocess.CompletedProcess(list(args), 0, json.dumps(row), "")
+
+        def fake_git(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            git_calls.append(list(args))
+            if list(args) == ["rev-parse", f"{head_sha}^{{tree}}"]:
+                return subprocess.CompletedProcess(list(args), 0, tree_sha + "\n", "")
+            if list(args) == ["diff", "--binary", "canonical-integration", head_sha]:
+                return subprocess.CompletedProcess(list(args), 0, "binary diff\n", "")
+            raise AssertionError(f"unexpected git call: {args}")
+
+        with mock.patch.object(self.actions, "gh", side_effect=fake_gh), mock.patch.object(
+            self.actions, "git", side_effect=fake_git
+        ):
+            facts = self.actions._topology_pr_facts(41)
+
+        self.assertIsInstance(facts, PRState)
+        self.assertEqual(
+            PRState(
+                41, "OPEN", True, "canonical-integration", "refactor/2026-07-15_issue-77",
+                head_sha, tree_sha, hashlib.sha256(b"Implement issue 77").hexdigest(),
+                hashlib.sha256(body.encode()).hexdigest(), hashlib.sha256(b"binary diff\n").hexdigest(),
+                (12, 77),
+            ),
+            facts,
+        )
+        self.assertEqual(
+            [["pr", "view", "41", "--json", "number,state,labels,baseRefName,headRefName,headRefOid,title,body"]],
+            gh_calls,
+        )
+        self.assertEqual(
+            [["rev-parse", f"{head_sha}^{{tree}}"], ["diff", "--binary", "canonical-integration", head_sha]],
+            git_calls,
+        )
+
+    def test_topology_read_publication_uses_real_pr_adapter_and_configured_remote(self) -> None:
+        identity = ControllerTopologyIdentity(77, "issue-77", "refactor", date(2026, 7, 15))
+        final_sha = "f" * 40
+        worktree = self.tmp / ".worktrees" / identity.worktree_name
+        worktree.mkdir(parents=True, exist_ok=True)
+        receipt = self.tmp / ".refactor-loop" / "state" / "publish-verification" / "jobs" / "adapter"
+        receipt.mkdir(parents=True)
+        (receipt / "request.json").write_text(json.dumps({
+            "issue": 77, "head_ref": identity.branch, "verified_sha": final_sha,
+        }), encoding="utf-8")
+        (receipt / "result.json").write_text(json.dumps({"status": "VERIFIED"}), encoding="utf-8")
+        request = PublishExactHeadRequest(identity, final_sha, "upstream", "canonical-integration", 9, str(receipt), "", "")
+        worktree_state = WorktreeState("c" * 40, final_sha, final_sha, True, identity.branch, final_sha, True, False, (41,))
+        pr_rows = {
+            41: {"number": 41, "state": "OPEN", "labels": [{"name": labels.MANAGED}], "baseRefName": "canonical-integration", "headRefName": identity.branch, "headRefOid": final_sha, "title": "Canonical", "body": "Closes #77"},
+            9: {"number": 9, "state": "OPEN", "labels": [{"name": labels.MANAGED}], "baseRefName": "canonical-integration", "headRefName": "legacy", "headRefOid": "e" * 40, "title": "Legacy", "body": "Closes #77"},
+        }
+        gh_calls: list[list[str]] = []
+        git_calls: list[list[str]] = []
+
+        def fake_gh(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            argv = list(args)
+            gh_calls.append(argv)
+            if argv[:3] == ["pr", "list", "--state"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([{"number": 41, "headRefName": identity.branch}]), "")
+            if argv[:2] == ["pr", "view"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps(pr_rows[int(argv[2])]), "")
+            if argv == ["issue", "view", "77", "--json", "state,labels"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "OPEN", "labels": []}), "")
+            raise AssertionError(f"unexpected gh call: {argv}")
+
+        def fake_git(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            argv = list(args)
+            git_calls.append(argv)
+            if argv[0] == "rev-parse":
+                return subprocess.CompletedProcess(argv, 0, "d" * 40 + "\n", "")
+            if argv[0] == "diff":
+                return subprocess.CompletedProcess(argv, 0, f"diff:{argv[-1]}\n", "")
+            if argv == ["cat-file", "-e", f"{final_sha}^{{commit}}"]:
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            raise AssertionError(f"unexpected git call: {argv}")
+
+        with mock.patch.object(self.actions, "gh", side_effect=fake_gh), mock.patch.object(
+            self.actions, "git", side_effect=fake_git
+        ), mock.patch.object(self.actions, "_topology_read_worktree", return_value=worktree_state) as read_worktree:
+            snapshot = self.actions._topology_read_publication(request, worktree)
+
+        self.assertEqual((41,), tuple(pr.number for pr in snapshot.canonical_prs))
+        self.assertIsInstance(snapshot.legacy_pr, PRState)
+        self.assertEqual((9, "legacy", "e" * 40), (snapshot.legacy_pr.number, snapshot.legacy_pr.head_branch, snapshot.legacy_pr.head_sha))
+        self.assertEqual("OPEN", snapshot.linked_issue_state)
+        self.assertEqual("VERIFIED", snapshot.receipt.status)
+        read_worktree.assert_called_once_with(identity.branch, worktree, "canonical-integration", "upstream")
+        self.assertEqual(
+            ["pr", "list", "--state", "open", "--head", identity.branch, "--json", "number,headRefName"],
+            gh_calls[0],
+        )
+        self.assertEqual(["cat-file", "-e", f"{final_sha}^{{commit}}"], git_calls[-3])
+        self.assertEqual(["rev-parse", f"{final_sha}^{{tree}}"], git_calls[-2])
+        self.assertEqual(["diff", "--binary", "canonical-integration", final_sha], git_calls[-1])
+
+    def test_topology_read_retirement_maps_prs_sentinel_and_fails_closed_on_unavailable_pr(self) -> None:
+        final_sha = "a" * 40
+        review = ReviewGateProjection("MERGE", 41, final_sha, "review-digest")
+        request = RetireSupersededPRRequest(9, 41, 77, final_sha, "canonical-integration", review, self.pr_body)
+        sentinel_digest = "c" * 64
+        marker = f"<!-- crnd:controller-topology-supersession sentinel_digest={sentinel_digest} -->"
+        rows = [{"html_url": "https://example.test/comment/1", "body": f"{marker}\ncontroller-topology-supersession old_pr=9 replacement_pr=41 linked_issue=77"}]
+        pr_rows = {
+            9: {"number": 9, "state": "OPEN", "labels": [{"name": labels.MANAGED}], "baseRefName": "canonical-integration", "headRefName": "legacy", "headRefOid": "9" * 40, "title": "Old", "body": "Closes #77"},
+            41: {"number": 41, "state": "OPEN", "labels": [{"name": labels.MANAGED}], "baseRefName": "canonical-integration", "headRefName": "canonical", "headRefOid": final_sha, "title": "New", "body": "Closes #77"},
+        }
+        gh_calls: list[list[str]] = []
+
+        def fake_gh(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            argv = list(args)
+            gh_calls.append(argv)
+            if argv[:2] == ["api", "repos/owner/repo/issues/9/comments"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps([rows]), "")
+            if argv[:2] == ["pr", "view"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps(pr_rows[int(argv[2])]), "")
+            if argv == ["issue", "view", "77", "--json", "state,labels"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"state": "OPEN", "labels": []}), "")
+            raise AssertionError(f"unexpected gh call: {argv}")
+
+        def fake_git(args: Sequence[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
+            argv = list(args)
+            if argv[0] == "rev-parse":
+                return subprocess.CompletedProcess(argv, 0, "b" * 40 + "\n", "")
+            if argv[0] == "diff":
+                return subprocess.CompletedProcess(argv, 0, "same diff\n", "")
+            raise AssertionError(f"unexpected git call: {argv}")
+
+        with mock.patch.object(self.actions, "gh", side_effect=fake_gh), mock.patch.object(
+            self.actions, "git", side_effect=fake_git
+        ), mock.patch.object(self.actions, "_topology_review_projection", return_value=review) as read_review:
+            snapshot = self.actions._topology_read_retirement(request, sentinel_digest)
+
+        self.assertIsInstance(snapshot.old, PRState)
+        self.assertIsInstance(snapshot.replacement, PRState)
+        self.assertEqual(("https://example.test/comment/1",), snapshot.sentinel_urls)
+        read_review.assert_called_once_with(41, final_sha, "MERGE")
+        self.assertEqual(
+            ["api", "repos/owner/repo/issues/9/comments", "--paginate", "--slurp"], gh_calls[0]
+        )
+        self.assertEqual(["pr", "view", "9", "--json", "number,state,labels,baseRefName,headRefName,headRefOid,title,body"], gh_calls[1])
+        self.assertEqual(["pr", "view", "41", "--json", "number,state,labels,baseRefName,headRefName,headRefOid,title,body"], gh_calls[2])
+
+        with mock.patch.object(
+            self.actions, "gh", return_value=subprocess.CompletedProcess([], 1, "", "unavailable")
+        ):
+            with self.assertRaisesRegex(RuntimeError, "PR 41 unavailable"):
+                self.actions._topology_pr_facts(41)
 
     def test_record_recent_pr_merge_writes_rolling_artifact(self) -> None:
         facts = {

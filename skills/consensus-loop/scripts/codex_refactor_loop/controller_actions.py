@@ -98,6 +98,7 @@ from .secondary_mutation_backoff import (
     record_backoff_from_gh_output,
     record_content_creation_backoff,
 )
+from .state import read_json
 from .triage import apply_decision, load_triage_apply_config
 from .work_items import extract_closing_issue_numbers
 from .wakeup_plan import (
@@ -306,6 +307,37 @@ class ControllerActions:
         pr_target = self._normalize_lifecycle_target_or_raise(
             number, kind="pr", action="controller-topology-read", source="typed-request"
         )
+        result = self.gh(
+            ["pr", "view", pr_target, "--json", "number,state,labels,baseRefName,headRefName,headRefOid,title,body"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology PR {number} unavailable")
+        try:
+            row = json.loads(result.stdout)
+            if not isinstance(row, dict) or not isinstance(row.get("labels"), list):
+                raise ValueError("invalid PR projection")
+            head_sha = str(row.get("headRefOid") or "")
+            tree_sha = self._topology_git_stdout(["rev-parse", f"{head_sha}^{{tree}}"])
+            diff = self.git(["diff", "--binary", str(row.get("baseRefName") or ""), head_sha], check=False)
+            if diff.returncode != 0:
+                raise RuntimeError(f"controller topology PR {number} diff unavailable")
+            label_names = {str(item.get("name") or "") for item in row["labels"] if isinstance(item, dict)}
+            return PRState(
+                number=int(row.get("number") or 0),
+                state=str(row.get("state") or ""),
+                managed=labels.MANAGED in label_names,
+                base_branch=str(row.get("baseRefName") or ""),
+                head_branch=str(row.get("headRefName") or ""),
+                head_sha=head_sha,
+                head_tree_sha=tree_sha,
+                title_digest=hashlib.sha256(str(row.get("title") or "").encode("utf-8")).hexdigest(),
+                body_digest=hashlib.sha256(str(row.get("body") or "").encode("utf-8")).hexdigest(),
+                diff_digest=hashlib.sha256(diff.stdout.encode("utf-8")).hexdigest(),
+                closing_issue_numbers=tuple(sorted(extract_closing_issue_numbers(str(row.get("body") or "")))),
+            )
+        except (ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"controller topology PR {number} invalid") from exc
 
     def _topology_issue_state(self, number: int) -> str:
         issue_target = self._normalize_lifecycle_target_or_raise(
@@ -322,32 +354,6 @@ class ControllerActions:
             return state
         except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"controller topology issue {number} invalid") from exc
-        result = self.gh(
-            ["pr", "view", pr_target, "--json", "number,state,labels,baseRefName,headRefName,headRefOid,title,body"],
-            check=False,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"controller topology PR {number} unavailable")
-        row = json.loads(result.stdout)
-        head_sha = str(row.get("headRefOid") or "")
-        tree_sha = self._topology_git_stdout(["rev-parse", f"{head_sha}^{{tree}}"])
-        diff = self.git(["diff", "--binary", str(row.get("baseRefName") or ""), head_sha], check=False)
-        if diff.returncode != 0:
-            raise RuntimeError(f"controller topology PR {number} diff unavailable")
-        label_names = {str(item.get("name") or "") for item in row.get("labels") or [] if isinstance(item, dict)}
-        return PRState(
-            number=int(row.get("number") or 0),
-            state=str(row.get("state") or ""),
-            managed=labels.MANAGED in label_names,
-            base_branch=str(row.get("baseRefName") or ""),
-            head_branch=str(row.get("headRefName") or ""),
-            head_sha=head_sha,
-            head_tree_sha=tree_sha,
-            title_digest=hashlib.sha256(str(row.get("title") or "").encode("utf-8")).hexdigest(),
-            body_digest=hashlib.sha256(str(row.get("body") or "").encode("utf-8")).hexdigest(),
-            diff_digest=hashlib.sha256(diff.stdout.encode("utf-8")).hexdigest(),
-            closing_issue_numbers=tuple(sorted(extract_closing_issue_numbers(str(row.get("body") or "")))),
-        )
 
     def _topology_create_local_ref(self, branch: str, final_sha: str) -> None:
         self.git(["branch", branch, final_sha])

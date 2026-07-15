@@ -1,8 +1,11 @@
 import tempfile
 import unittest
+import sys
 from pathlib import Path
 
 import subprocess
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from codex_refactor_loop.implement_lifecycle import (
     _implement_run_artifact_done_marker,
@@ -77,14 +80,14 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logs, _runs = self._repo(tmp)
             repo = Path(tmp)
-            worktree = repo / ".worktrees" / "iter421-issue-421"
+            worktree = repo / ".worktrees" / "refactor__2026-07-15_issue-421"
             worktree.mkdir(parents=True)
             log = logs / "implement-issue-421.log"
             log.write_text("IMPLEMENT_DONE:issue-421:ok\nEXIT=0\n", encoding="utf-8")
 
             def runner(command):
                 if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, "refactor/iter421-issue-421\n", "")
+                    return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-421\n", "")
                 if command[-3:] == ["merge-base", "HEAD", "origin/integration"]:
                     return subprocess.CompletedProcess(command, 0, "old-base\n", "")
                 if command[-2:] == ["--verify", "origin/integration"]:
@@ -95,7 +98,11 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
 
             state = classify_implement_attempt(
                 repo_root=repo,
-                action={"target_number": 421},
+                action={
+                    "target_number": 421,
+                    "head_ref": "refactor/2026-07-15_issue-421",
+                    "worktree": str(worktree),
+                },
                 log_path=log,
                 integration_branch="integration",
                 command_runner=runner,
@@ -109,14 +116,14 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logs, _runs = self._repo(tmp)
             repo = Path(tmp)
-            worktree = repo / ".worktrees" / "iter581-issue-581"
+            worktree = repo / ".worktrees" / "refactor__2026-07-15_issue-581"
             worktree.mkdir(parents=True)
             log = logs / "implement-issue-581.log"
             log.write_text("0 LOC 收口，没有修改任何仓库源码\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n", encoding="utf-8")
 
             def runner(command):
                 if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, "refactor/iter581-issue-581\n", "")
+                    return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-581\n", "")
                 if command[-3:] == ["merge-base", "HEAD", "origin/integration"]:
                     return subprocess.CompletedProcess(command, 0, "old-base\n", "")
                 if command[-2:] == ["--verify", "origin/integration"]:
@@ -129,7 +136,11 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
 
             state = classify_implement_attempt(
                 repo_root=repo,
-                action={"target_number": 581},
+                action={
+                    "target_number": 581,
+                    "head_ref": "refactor/2026-07-15_issue-581",
+                    "worktree": str(worktree),
+                },
                 log_path=log,
                 integration_branch="integration",
                 command_runner=runner,
@@ -145,21 +156,30 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logs, _runs = self._repo(tmp)
             repo = Path(tmp)
-            worktree = repo / ".worktrees" / "iter581-issue-581"
+            worktree = repo / ".worktrees" / "refactor__2026-07-15_issue-581"
             worktree.mkdir(parents=True)
             log = logs / "implement-issue-581.log"
             log.write_text("no code changes required\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n", encoding="utf-8")
 
             def runner(command):
                 if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, "refactor/iter581-issue-581\n", "")
+                    return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-581\n", "")
                 if command[-2:] == ["status", "--porcelain"]:
                     return subprocess.CompletedProcess(command, 0, "", "")
                 if command[-2:] == ["diff", "--quiet"]:
                     return subprocess.CompletedProcess(command, 0, "", "")
                 return subprocess.CompletedProcess(command, 0, "", "")
 
-            cleared = clear_redispatchable_implement_log(repo_root=repo, log_path=log, command_runner=runner)
+            cleared = clear_redispatchable_implement_log(
+                repo_root=repo,
+                action={
+                    "target_number": 581,
+                    "head_ref": "refactor/2026-07-15_issue-581",
+                    "worktree": str(worktree),
+                },
+                log_path=log,
+                command_runner=runner,
+            )
 
             self.assertFalse(cleared)
             self.assertTrue(log.exists())
@@ -168,14 +188,14 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logs, _runs = self._repo(tmp)
             repo = Path(tmp)
-            worktree = repo / ".worktrees" / "iter553-issue-553"
+            worktree = repo / ".worktrees" / "refactor__2026-07-15_issue-553"
             worktree.mkdir(parents=True)
             log = logs / "implement-issue-553.log"
             log.write_text("IMPLEMENT_DONE:issue-553:ok\nEXIT=0\n", encoding="utf-8")
 
             def runner(command):
                 if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, "refactor/iter553-issue-553\n", "")
+                    return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-553\n", "")
                 if command[-3:] == ["merge-base", "HEAD", "origin/integration"]:
                     return subprocess.CompletedProcess(command, 0, "base\n", "")
                 if command[-2:] == ["--verify", "origin/integration"]:
@@ -188,7 +208,11 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
 
             state = classify_implement_attempt(
                 repo_root=repo,
-                action={"target_number": 553},
+                action={
+                    "target_number": 553,
+                    "head_ref": "refactor/2026-07-15_issue-553",
+                    "worktree": str(worktree),
+                },
                 log_path=log,
                 integration_branch="integration",
                 command_runner=runner,
@@ -201,7 +225,7 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             logs, runs = self._repo(tmp)
             repo = Path(tmp)
-            worktree = repo / ".worktrees" / "iter553-issue-553"
+            worktree = repo / ".worktrees" / "refactor__2026-07-15_issue-553"
             worktree.mkdir(parents=True)
             (runs / "implement-issue-553.md").write_text(
                 "summary\n⟦AI:AUTO-LOOP⟧\nIMPLEMENT_DONE:issue-553:ok\n", encoding="utf-8"
@@ -215,7 +239,7 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
 
             def runner(command):
                 if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                    return subprocess.CompletedProcess(command, 0, "refactor/iter553-issue-553\n", "")
+                    return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-553\n", "")
                 if command[-3:] == ["merge-base", "HEAD", "origin/integration"]:
                     return subprocess.CompletedProcess(command, 0, "base\n", "")
                 if command[-2:] == ["--verify", "origin/integration"]:
@@ -226,7 +250,11 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
 
             state = classify_implement_attempt(
                 repo_root=repo,
-                action={"target_number": 553},
+                action={
+                    "target_number": 553,
+                    "head_ref": "refactor/2026-07-15_issue-553",
+                    "worktree": str(worktree),
+                },
                 log_path=log,
                 integration_branch="integration",
                 command_runner=runner,
@@ -234,7 +262,7 @@ class ImplementArtifactMarkerFallbackTests(unittest.TestCase):
 
             self.assertTrue(state.publish_ready)
             self.assertEqual(state.marker, "IMPLEMENT_DONE:issue-553:ok")
-            self.assertEqual(state.head_ref, "refactor/iter553-issue-553")
+            self.assertEqual(state.head_ref, "refactor/2026-07-15_issue-553")
 
 
 if __name__ == "__main__":

@@ -24,6 +24,11 @@ from codex_refactor_loop.github_actor import GitHubActorAdmission  # noqa: E402
 from codex_refactor_loop.phase9.router import Phase9Router  # noqa: E402
 from codex_refactor_loop.wakeup_plan import build_plan  # noqa: E402
 from codex_refactor_loop.wakeup_runner import WakeupRunner  # noqa: E402
+from codex_refactor_loop.controller_topology_authority import (  # noqa: E402
+    RetireSupersededPRResult,
+    ReviewGateProjection,
+    TopologyPhase,
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +55,15 @@ class FakeControllerActions:
     def merge_pr(self, target: str) -> int:
         self.calls.append(("merge_pr", target))
         return 0
+
+    def _topology_review_projection(self, pr_number: int, head_sha: str, decision: str):
+        return ReviewGateProjection(decision, pr_number, head_sha, "evidence-digest")
+
+    def _retire_superseded_pr(self, request):
+        self.calls.append(("retire_superseded_pr", request.old_pr_number))
+        return RetireSupersededPRResult(
+            request.old_pr_number, request.replacement_pr_number, TopologyPhase.OLD_PR_CLOSED, "comment"
+        )
 
 
 class HeadlessDogfoodFixture:
@@ -190,10 +204,27 @@ class HeadlessDogfoodFixture:
             return build_plan(self.repo)
 
     def run_runner(self):
+        def load_plan(repo: Path) -> dict:
+            plan = build_plan(repo)
+            for action in plan.get("actions", []):
+                if action.get("controller_action") == "review_gate" and action.get("target_number") == 77:
+                    action.update(
+                        {
+                            "superseded_pr_number": 76,
+                            "linked_issue": 77,
+                            "base_ref": "auto-refact-dev",
+                            "supersession_body": (
+                                "Superseded by replacement PR #77.\n\n"
+                                "<!-- crnd:controller-topology-supersession -->\n"
+                            ),
+                        }
+                    )
+            return plan
+
         with mock.patch("codex_refactor_loop.wakeup_plan.subprocess.run", side_effect=self.fake_subprocess_run):
             runner = WakeupRunner(
                 self.ctx,
-                plan_loader=lambda repo: build_plan(repo),
+                plan_loader=load_plan,
                 actions=self.actions,
                 command_runner=self.fake_command_runner,
             )
@@ -473,7 +504,7 @@ class HeadlessDogfoodE2ETests(unittest.TestCase):
 
             results = fixture.run_runner()
 
-            self.assertEqual("applied", results[0].status)
+            self.assertEqual("applied", results[0].status, results[0])
             self.assertEqual("dispatch_consensus_implementation", fixture.actions.calls[0][0])
             self.assertEqual(496, fixture.actions.calls[0][1]["target_number"])
             self.assertIn(
@@ -569,6 +600,9 @@ class HeadlessDogfoodE2ETests(unittest.TestCase):
     def test_review_gate_merge_projection_calls_fake_named_helper_only(self) -> None:
         with HeadlessDogfoodFixture(self) as fixture:
             fixture.add_pr(77, head_sha="abc1234")
+            fixture.prs[77]["headRefName"] = "refactor/2026-07-15_issue-77"
+            fixture.add_pr(76, head_sha="abc1234")
+            fixture.prs[76]["body"] = "Closes #77"
             fixture.write_review_evidence(77, head_sha="abc1234")
 
             plan = fixture.plan()
@@ -576,8 +610,11 @@ class HeadlessDogfoodE2ETests(unittest.TestCase):
             self.assertTrue(review_actions)
             results = fixture.run_runner()
 
-            self.assertEqual("applied", results[0].status)
-            self.assertEqual([("merge_pr", "77")], fixture.actions.calls)
+            self.assertEqual("applied", results[0].status, results[0])
+            self.assertEqual(
+                [("retire_superseded_pr", 76), ("merge_pr", "77")],
+                fixture.actions.calls,
+            )
             self.assertEqual(review_actions[0]["action_id"], results[0].action_id)
             self.assertEqual("wakeup-runner-396", review_actions[0]["runner_authority"])
             fixture.assert_no_real_lifecycle_helper()

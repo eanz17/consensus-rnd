@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import fcntl
 import os
 import re
 import subprocess
@@ -10,7 +12,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +20,27 @@ from .active_controller import require_active_controller, write_active_controlle
 from . import labels
 from .banners import BannerRequest, build_status_banner, gh_comment_command
 from .context import LoopContext
+from .controller_topology_authority import (
+    ControllerTopologyAuthority,
+    ControllerTopologyIdentity,
+    CreateCompliantWorktreeRequest,
+    CreateCompliantWorktreeResult,
+    PRState,
+    PublicationSnapshot,
+    ReceiptState,
+    ReviewGateProjection,
+    PublishExactHeadRequest,
+    PublishExactHeadResult,
+    RetirementSnapshot,
+    RetireSupersededPRRequest,
+    RetireSupersededPRResult,
+    SUPERSESSION_SENTINEL,
+    TopologyProvenance,
+    WorktreeState,
+    controller_topology_branch_is_durable,
+    parse_legacy_implementation_head_evidence,
+    supersession_marker,
+)
 from .cross_instance_stand_down import CrossInstanceAdmission, check_cross_instance_admission
 from .default_issue_intake import DefaultIssueIntakeClaim, DefaultIssueIntakeResult
 from .gh_invoke import build_gh_argv
@@ -58,14 +81,17 @@ from .publish_verification import (
 from .release.publisher import ReleasePublisher
 from .release.required_checks import ReleaseRequiredChecksProjection, required_release_checks
 from .runtime_copy import copy_for, current_work_language
-from .git import Git
 from .review_fix_dispatch import (
     ReviewFixDispatchSpec,
     ReviewThreadCompletionEvidence,
     validate_review_thread_completion,
 )
 from .review_evidence_recovery import RepeatedReviewBlockerInput, RepeatedReviewBlockerProjection, project_repeated_review_blocker
-from .review_gate_selection import ParsedGithubReviewEvidence, parse_github_review_evidence
+from .review_gate_selection import (
+    ParsedGithubReviewEvidence,
+    parse_github_review_evidence,
+    select_latest_live_head_review_evidence,
+)
 from .reviewer_liveness import ReviewerLivenessProjection
 from .secondary_mutation_backoff import (
     currently_backing_off,
@@ -109,7 +135,6 @@ GITHUB_LIFECYCLE_TARGET_RE = re.compile(r"^[1-9][0-9]*$")
 BODY_CLOSING_ISSUE_TARGET_RE = re.compile(r"(?im)\bCloses\s+#([^\s,;:.)\]}\\]*)")
 REVIEW_ROLES = ("architect", "tests", "quality")
 PUBLISH_IMPLEMENTATION_FALLBACK_DELEGATED_EXIT = 75
-MANAGED_PR_HEAD_RE = re.compile(r"^refactor/iter([1-9][0-9]*)-([A-Za-z0-9._-]+)$")
 REBASE_RESOLVE_DONE_RE = re.compile(r"^REBASE_RESOLVE_DONE:([1-9][0-9]*):([A-Za-z0-9._-]+)$")
 REBASE_RESOLVE_BLOCKED_RE = re.compile(
     r"^REBASE_RESOLVE_BLOCKED:([1-9][0-9]*):(conflict|human-decision|build-broken|other):(.+)$"
@@ -127,6 +152,366 @@ class ControllerActions:
         self.review_base_branch = str(merged_env.get("REVIEW_BASE_BRANCH", "")).strip()
         if ctx.host_env and ctx.gh_repo_slug:
             self._require_branch_config()
+
+    @property
+    def repo_root(self) -> Path:
+        return self.ctx.repo_root
+
+    def _topology_authority(self) -> ControllerTopologyAuthority:
+        return ControllerTopologyAuthority(self)
+
+    def _topology_require_fresh_owner(self, action: str) -> None:
+        self._require_owner_or_raise(action)
+
+    def _topology_read_provenance(self, key: str) -> TopologyProvenance | None:
+        path = self._topology_provenance_path(key)
+        if not path.exists():
+            return None
+        try:
+            row = json.loads(path.read_text(encoding="utf-8"))
+            row["phase"] = __import__(
+                f"{__package__}.controller_topology_authority", fromlist=["TopologyPhase"]
+            ).TopologyPhase(str(row["phase"]))
+            record = TopologyProvenance(**row)
+            if record != record.exact():
+                raise ValueError("digest does not match exact payload")
+            return record
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"controller topology provenance invalid: {path}: {exc}") from exc
+
+    def _topology_cas_provenance(
+        self,
+        key: str,
+        expected_generation: int | None,
+        expected_digest: str | None,
+        value: TopologyProvenance,
+    ) -> None:
+        path = self._topology_provenance_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        with lock_path.open("a", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            current = self._topology_read_provenance(key)
+            if value != value.exact() or value.key != key:
+                raise RuntimeError("controller topology proposed provenance is not exact")
+            actual = None if current is None else (current.generation, current.digest)
+            expected = None if expected_generation is None else (expected_generation, expected_digest)
+            if actual != expected:
+                raise RuntimeError("controller topology provenance CAS conflict")
+            payload = value.payload()
+            payload["digest"] = value.digest
+            fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, sort_keys=True, indent=2)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temp_name, path)
+            finally:
+                try:
+                    os.unlink(temp_name)
+                except FileNotFoundError:
+                    pass
+            reread = self._topology_read_provenance(key)
+            if reread != value:
+                raise RuntimeError("controller topology provenance exact reread failed")
+
+    def _topology_provenance_path(self, key: str) -> Path:
+        safe = re.sub(r"[^A-Za-z0-9._-]", "__", key)
+        return self.repo_root / ".refactor-loop" / "state" / "controller-topology" / f"{safe}.json"
+
+    def _topology_read_worktree(self, branch: str, worktree: Path, base_ref: str, remote: str) -> WorktreeState:
+        registered = self._worktree_for_branch(branch)
+        actual_path = registered.resolve() if registered is not None else None
+        requested_path = worktree.resolve()
+        head = None
+        current_branch = None
+        clean = False
+        if actual_path == requested_path and worktree.exists():
+            current_branch = self._git_in(worktree, ["rev-parse", "--abbrev-ref", "HEAD"], check=False).stdout.strip()
+            head = self._git_in(worktree, ["rev-parse", "HEAD"], check=False).stdout.strip()
+            status = self._git_in(worktree, ["status", "--porcelain"], check=False)
+            clean = status.returncode == 0 and not status.stdout.strip()
+        return WorktreeState(
+            base_ref_sha=self._topology_git_stdout(["rev-parse", base_ref]),
+            local_ref_sha=self._topology_local_ref(branch),
+            remote_ref_sha=self._topology_remote_ref(remote, branch),
+            worktree_registered=actual_path == requested_path,
+            worktree_branch=current_branch,
+            worktree_head_sha=head,
+            worktree_clean=clean,
+            foreign_attachment=actual_path is not None and actual_path != requested_path,
+            open_pr_numbers=self._topology_open_pr_numbers(branch),
+        )
+
+    def _topology_create_worktree(self, branch: str, worktree: Path, base_sha: str) -> None:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        self.git(["worktree", "add", "-b", branch, str(worktree), base_sha])
+
+    def _topology_attach_worktree(self, branch: str, worktree: Path) -> None:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        self.git(["worktree", "add", str(worktree), branch])
+
+    def _create_compliant_worktree(self, iteration: str, cluster: str, base: str) -> tuple[Path, str]:
+        _validate_safe_worktree_fields(str(iteration), cluster)
+        base_ref = base if base.startswith("origin/") else f"origin/{base}"
+        base_sha = self._topology_git_stdout(["rev-parse", base_ref])
+        result = self._topology_authority().create_compliant_worktree(
+            CreateCompliantWorktreeRequest(
+                identity=ControllerTopologyIdentity(int(iteration), cluster.lower(), "refactor", date.today()),
+                base_ref=base_ref,
+                base_sha=base_sha,
+            )
+        )
+        return result.worktree, result.branch
+
+    def _topology_git_stdout(self, args: Sequence[str]) -> str:
+        result = self.git(args, check=False)
+        if result.returncode != 0 or not result.stdout.strip():
+            raise RuntimeError(f"controller topology git fact unavailable: {' '.join(args)}")
+        return result.stdout.strip()
+
+    def _topology_local_ref(self, branch: str) -> str | None:
+        result = self.git(["rev-parse", "--verify", f"refs/heads/{branch}"], check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def _topology_remote_ref(self, remote: str, branch: str) -> str | None:
+        result = self.git(["ls-remote", "--heads", remote, f"refs/heads/{branch}"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology remote fact unavailable: {remote}/{branch}")
+        return result.stdout.split()[0] if result.stdout.strip() else None
+
+    def _topology_open_pr_numbers(self, branch: str) -> tuple[int, ...]:
+        result = self.gh(["pr", "list", "--state", "open", "--head", branch, "--json", "number,headRefName"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology PR-head facts unavailable: {branch}")
+        rows = json.loads(result.stdout or "[]")
+        return tuple(int(row["number"]) for row in rows if row.get("headRefName") == branch)
+
+    def _topology_pr_head(self, number: int) -> tuple[str, str]:
+        pr_target = self._normalize_lifecycle_target_or_raise(
+            number, kind="pr", action="controller-topology-read", source="typed-request"
+        )
+        result = self.gh(["pr", "view", pr_target, "--json", "headRefName,headRefOid"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology PR {number} unavailable")
+        row = json.loads(result.stdout)
+        return str(row.get("headRefName") or ""), str(row.get("headRefOid") or "")
+
+    def _topology_pr_head_sha(self, number: int) -> str:
+        return self._topology_pr_head(number)[1]
+
+    def _topology_pr_facts(self, number: int) -> PRState:
+        pr_target = self._normalize_lifecycle_target_or_raise(
+            number, kind="pr", action="controller-topology-read", source="typed-request"
+        )
+
+    def _topology_issue_state(self, number: int) -> str:
+        issue_target = self._normalize_lifecycle_target_or_raise(
+            number, kind="issue", action="controller-topology-read", source="typed-request"
+        )
+        result = self.gh(["issue", "view", issue_target, "--json", "state,labels"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology issue {number} unavailable")
+        try:
+            row = json.loads(result.stdout)
+            state = str(row["state"])
+            if not isinstance(row.get("labels"), list) or state not in {"OPEN", "CLOSED"}:
+                raise ValueError("invalid issue projection")
+            return state
+        except (ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"controller topology issue {number} invalid") from exc
+        result = self.gh(
+            ["pr", "view", pr_target, "--json", "number,state,labels,baseRefName,headRefName,headRefOid,title,body"],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology PR {number} unavailable")
+        row = json.loads(result.stdout)
+        head_sha = str(row.get("headRefOid") or "")
+        tree_sha = self._topology_git_stdout(["rev-parse", f"{head_sha}^{{tree}}"])
+        diff = self.git(["diff", "--binary", str(row.get("baseRefName") or ""), head_sha], check=False)
+        if diff.returncode != 0:
+            raise RuntimeError(f"controller topology PR {number} diff unavailable")
+        label_names = {str(item.get("name") or "") for item in row.get("labels") or [] if isinstance(item, dict)}
+        return PRState(
+            number=int(row.get("number") or 0),
+            state=str(row.get("state") or ""),
+            managed=labels.MANAGED in label_names,
+            base_branch=str(row.get("baseRefName") or ""),
+            head_branch=str(row.get("headRefName") or ""),
+            head_sha=head_sha,
+            head_tree_sha=tree_sha,
+            title_digest=hashlib.sha256(str(row.get("title") or "").encode("utf-8")).hexdigest(),
+            body_digest=hashlib.sha256(str(row.get("body") or "").encode("utf-8")).hexdigest(),
+            diff_digest=hashlib.sha256(diff.stdout.encode("utf-8")).hexdigest(),
+            closing_issue_numbers=tuple(sorted(extract_closing_issue_numbers(str(row.get("body") or "")))),
+        )
+
+    def _topology_create_local_ref(self, branch: str, final_sha: str) -> None:
+        self.git(["branch", branch, final_sha])
+
+    def _topology_push_exact_ref(self, remote: str, branch: str, final_sha: str) -> None:
+        self.git(["push", remote, f"{final_sha}:refs/heads/{branch}"])
+
+    def _topology_finalize_receipt(self, receipt_id: str, pr_number: int) -> None:
+        mark_publish_verification_published(
+            Path(receipt_id), pr_number=pr_number, remote_oid=self._topology_pr_head_sha(pr_number)
+        )
+
+    def _topology_read_publication(self, request: PublishExactHeadRequest, worktree: Path) -> PublicationSnapshot:
+        canonical = tuple(self._topology_pr_facts(number) for number in self._topology_open_pr_numbers(request.identity.branch))
+        legacy = self._topology_pr_facts(request.legacy_pr_number)
+        request_row = read_json(Path(request.receipt_id) / "request.json", {})
+        result_row = read_json(Path(request.receipt_id) / "result.json", {})
+        published_row = read_json(Path(request.receipt_id) / "published.json", {})
+        receipt_status = "PUBLISHED" if published_row else ("VERIFIED" if result_row.get("status") == "VERIFIED" else "")
+        receipt = ReceiptState(
+            request.receipt_id, receipt_status, int(request_row.get("issue") or 0), request.base_branch,
+            str(request_row.get("head_ref") or ""), str(request_row.get("verified_sha") or ""),
+            int(published_row["pr_number"]) if str(published_row.get("pr_number") or "").isdigit() else None,
+        )
+        worktree_state = self._topology_read_worktree(
+            request.identity.branch, worktree, request.base_branch, request.configured_remote
+        )
+        commit = self.git(["cat-file", "-e", f"{request.final_sha}^{{commit}}"], check=False)
+        tree = self._topology_git_stdout(["rev-parse", f"{request.final_sha}^{{tree}}"])
+        diff = self.git(["diff", "--binary", request.base_branch, request.final_sha], check=False)
+        if diff.returncode != 0:
+            raise RuntimeError("controller topology final diff unavailable")
+        final_diff_digest = hashlib.sha256(diff.stdout.encode("utf-8")).hexdigest()
+        return PublicationSnapshot(
+            worktree_state, commit.returncode == 0, tree, final_diff_digest,
+            worktree_state.local_ref_sha, worktree_state.remote_ref_sha,
+            canonical, legacy, self._topology_issue_state(request.identity.issue_number), receipt,
+        )
+
+    def _topology_create_or_update_pr(self, request: PublishExactHeadRequest, existing: PRState | None) -> int:
+        issue = str(request.identity.issue_number)
+        title_path = self.ctx.durable_artifact_path(implementation_pr_title_path(issue))
+        body_path = self.ctx.durable_artifact_path(implementation_pr_body_path(issue))
+        title = title_path.read_text(encoding="utf-8").strip()
+        if existing is None:
+            return self.open_pr_with_label(title, body_path, base=request.base_branch, head=request.identity.branch)
+        result = self.gh(["pr", "edit", str(existing.number), "--title", title, "--body-file", str(body_path)], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology PR update failed: {_single_line(result.stderr or result.stdout)}")
+        return existing.number
+
+    def _topology_read_retirement(self, request: RetireSupersededPRRequest, sentinel_digest: str) -> RetirementSnapshot:
+        comments = self.gh(
+            ["api", f"repos/{self.ctx.gh_repo_slug}/issues/{request.old_pr_number}/comments", "--paginate", "--slurp"],
+            check=False,
+        )
+        if comments.returncode != 0:
+            raise RuntimeError("controller topology supersession comments unavailable")
+        rows = _flatten_gh_pages(json.loads(comments.stdout or "[]"))
+        marker = supersession_marker(sentinel_digest) if sentinel_digest else ""
+        sentinel_urls = tuple(
+            str(row.get("html_url") or "") for row in rows
+            if marker and str(row.get("body") or "").count(marker) == 1
+            and f"old_pr={request.old_pr_number}" in str(row.get("body") or "")
+            and f"replacement_pr={request.replacement_pr_number}" in str(row.get("body") or "")
+            and f"linked_issue={request.linked_issue_number}" in str(row.get("body") or "")
+        )
+        review = self._topology_review_projection(
+            request.replacement_pr_number,
+            request.final_sha,
+            request.review.decision,
+        )
+        return RetirementSnapshot(
+            self._topology_pr_facts(request.old_pr_number),
+            self._topology_pr_facts(request.replacement_pr_number),
+            self._topology_issue_state(request.linked_issue_number), review, sentinel_urls,
+        )
+
+    def _topology_review_projection(
+        self,
+        replacement_pr_number: int,
+        live_head_sha: str,
+        decision: str,
+    ) -> ReviewGateProjection:
+        result = self.gh(
+            [
+                "api",
+                f"repos/{self.ctx.gh_repo_slug}/issues/{replacement_pr_number}/comments",
+                "--paginate",
+                "--slurp",
+            ],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("controller topology canonical review evidence unavailable")
+        evidences: list[ParsedGithubReviewEvidence] = []
+        for index, row in enumerate(_flatten_gh_pages(json.loads(result.stdout or "[]"))):
+            parsed = parse_github_review_evidence(
+                str(row.get("body") or ""),
+                replacement_pr_number,
+                source="github:issues/comments",
+                created_at=str(row.get("created_at") or ""),
+                source_index=index,
+                comment_id=int(row["id"]) if isinstance(row.get("id"), int) else None,
+            )
+            if parsed is not None:
+                evidences.append(parsed)
+        selection = select_latest_live_head_review_evidence(
+            evidences,
+            live_head_sha=live_head_sha,
+            required_roles=REVIEW_ROLES,
+        )
+        if selection.invalid or selection.pending or selection.terminal_failed_roles:
+            raise RuntimeError("controller topology canonical review evidence is not merge-capable")
+        if set(selection.by_role) != set(REVIEW_ROLES):
+            raise RuntimeError("controller topology canonical review evidence is incomplete")
+        verdicts = {role: str(selection.by_role[role].verdict) for role in REVIEW_ROLES}
+        if "reject" in verdicts.values() or "approve" not in verdicts.values():
+            raise RuntimeError("controller topology canonical review evidence is not merge-capable")
+        expected_decision = "MERGE_WITH_COMMENTS" if "comment" in verdicts.values() else "MERGE"
+        if decision != expected_decision:
+            raise RuntimeError("controller topology review decision changed")
+        evidence_payload = {
+            role: {
+                "head_sha": selection.by_role[role].head_sha,
+                "round": selection.by_role[role].round_number,
+                "verdict": verdicts[role],
+                "created_at": selection.by_role[role].created_at,
+                "comment_id": selection.by_role[role].comment_id,
+            }
+            for role in REVIEW_ROLES
+        }
+        evidence_digest = hashlib.sha256(
+            json.dumps(evidence_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return ReviewGateProjection(
+            decision=expected_decision,
+            replacement_pr_number=replacement_pr_number,
+            live_head_sha=live_head_sha,
+            evidence_digest=evidence_digest,
+        )
+
+    def _topology_post_supersession(self, request: RetireSupersededPRRequest, sentinel_digest: str) -> str:
+        body = request.supersession_body_file.read_text(encoding="utf-8")
+        if body.count(SUPERSESSION_SENTINEL) != 1:
+            raise RuntimeError("controller topology supersession placeholder changed")
+        metadata = (f"controller-topology-supersession old_pr={request.old_pr_number} "
+                    f"replacement_pr={request.replacement_pr_number} linked_issue={request.linked_issue_number}")
+        body = body.replace(SUPERSESSION_SENTINEL, supersession_marker(sentinel_digest)).rstrip() + f"\n{metadata}\n"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write(body)
+            path = Path(handle.name)
+        try:
+            result = self.gh(["pr", "comment", str(request.old_pr_number), "--body-file", str(path)], check=False)
+        finally:
+            path.unlink(missing_ok=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology supersession post failed: {_single_line(result.stderr or result.stdout)}")
+        return result.stdout.strip()
+
+    def _topology_close_old_pr(self, old_pr_number: int) -> None:
+        result = self.gh(["pr", "close", str(old_pr_number)], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"controller topology old PR close failed: {_single_line(result.stderr or result.stdout)}")
 
     def _require_branch_config(self) -> tuple[str, str]:
         missing = [
@@ -382,29 +767,6 @@ class ControllerActions:
     def _git_path_from_output(self, worktree: Path, output: str) -> Path:
         path = Path(output.strip())
         return path if path.is_absolute() else worktree / path
-
-    def safe_worktree(self, iteration: str, cluster: str, base: str) -> tuple[Path, str]:
-        _validate_safe_worktree_fields(str(iteration), cluster)
-        wt_path = self.ctx.repo_root / ".worktrees" / f"iter{iteration}-{cluster}"
-        branch = f"refactor/iter{iteration}-{cluster}"
-        if wt_path.is_dir():
-            sys.stderr.write(f"  ✓ worktree exists: {wt_path}\n")
-            self._write_branch_provenance(branch=branch, worktree=wt_path, issue=str(iteration), base_sha="")
-            return wt_path, branch
-        (self.ctx.repo_root / ".worktrees").mkdir(parents=True, exist_ok=True)
-        if self.git(["show-ref", "--quiet", f"refs/heads/{branch}"], check=False).returncode == 0:
-            result = self.git(["worktree", "add", str(wt_path), branch])
-        else:
-            result = self.git(["worktree", "add", "-b", branch, str(wt_path), base])
-        sys.stderr.write("\n".join(result.stderr.splitlines()[-2:]) + "\n")
-        self._write_branch_provenance(branch=branch, worktree=wt_path, issue=str(iteration), base_sha=base)
-        return wt_path, branch
-
-    def fresh_safe_worktree(self, iteration: str, cluster: str, base: str) -> tuple[Path, str]:
-        worktree, branch = Git(self.ctx.repo_root).fresh_safe_worktree(iteration, cluster, base)
-        base_sha = self._git_in(worktree, ["rev-parse", "HEAD"], check=False).stdout.strip()
-        self._write_branch_provenance(branch=branch, worktree=worktree, issue=str(iteration), base_sha=base_sha)
-        return worktree, branch
 
     def _ensure_pr_ready_for_merge(self, pr_target: str) -> int:
         draft = self.gh(["pr", "view", pr_target, "--json", "isDraft", "--jq", ".isDraft"], check=False)
@@ -1289,9 +1651,14 @@ class ControllerActions:
         )
         if denied is not None:
             return denied
-        identity_error = self._validate_publish_implementation_identity(action, issue_target, head_ref, worktree)
-        if identity_error:
-            sys.stderr.write(f"publish_implementation_output: {identity_error}\n")
+        topology_identity = _controller_topology_identity_from_head(head_ref, int(issue_target))
+        expected_worktree = None if topology_identity is None else self.ctx.repo_root / ".worktrees" / topology_identity.worktree_name
+        if topology_identity is None or worktree.resolve() != expected_worktree.resolve():
+            sys.stderr.write("publish_implementation_output: noncanonical topology identity\n")
+            return 2
+        branch = self._git_in(worktree, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+        if branch.returncode != 0 or branch.stdout.strip() != head_ref:
+            sys.stderr.write("publish_implementation_output: noncanonical branch\n")
             return 2
         branch_admission = self._require_branch_push_admission_or_return(
             "publish-implementation-output",
@@ -1301,9 +1668,6 @@ class ControllerActions:
         )
         if branch_admission is not None:
             return branch_admission
-        already_open_current = self._matching_current_implementation_pr(head_ref, issue_target, worktree)
-        if already_open_current is not None:
-            return 0
         title_error = self._implementation_pr_title_error(action, issue_target)
         if title_error:
             sys.stderr.write(f"publish_implementation_output: {title_error}\n")
@@ -1334,118 +1698,39 @@ class ControllerActions:
                 f"reason={verified.reason} artifact={self.ctx.durable_artifact_path(verified.job_dir)}\n"
             )
             return 3
-        pushed = self._push_verified_publish_sha(
-            worktree,
-            verified.candidate_sha,
-            head_ref,
-            verified.job_dir,
-        )
-        if pushed != 0:
-            return pushed
-        pr_error, pr_target = self._matching_implementation_pr(head_ref, issue_target)
-        if pr_error:
-            sys.stderr.write(f"publish_implementation_output: {pr_error}\n")
+        identity = topology_identity
+        legacy_pr_number = action.get("legacy_pr_number")
+        if identity is None or not isinstance(legacy_pr_number, int) or legacy_pr_number <= 0:
+            sys.stderr.write("publish_implementation_output: topology identity or legacy PR evidence missing\n")
             return 2
-        opened_pr = False
-        if pr_target is None:
-            try:
-                self.open_pr_with_label(
-                    self._implementation_pr_title(action, issue_target),
-                    self.ctx.durable_artifact_path(self._implementation_pr_body_file(action, issue_target)),
-                    base=self.integration_branch,
-                    head=head_ref,
+        title_path = self.ctx.repo_root / self.ctx.durable_artifact_path(
+            self._implementation_pr_title_file(action, issue_target)
+        )
+        body_path = self.ctx.repo_root / self.ctx.durable_artifact_path(
+            self._implementation_pr_body_file(action, issue_target)
+        )
+        try:
+            published = self._topology_authority().publish_exact_head(
+                PublishExactHeadRequest(
+                    identity=identity,
+                    final_sha=verified.candidate_sha,
+                    configured_remote="origin",
+                    base_branch=self.integration_branch,
+                    legacy_pr_number=legacy_pr_number,
+                    receipt_id=str(verified.job_dir.resolve()),
+                    title_digest=hashlib.sha256(title_path.read_text(encoding="utf-8").strip().encode("utf-8")).hexdigest(),
+                    body_digest=hashlib.sha256(body_path.read_bytes()).hexdigest(),
                 )
-            except Exception as exc:
-                sys.stderr.write(f"publish_implementation_output: pr_open_failed:{_single_line(str(exc))}\n")
-                record_publish_verification_retry(verified.job_dir, "pr-open-failed")
-                return 2
-            verify_error, verified_pr = self._matching_implementation_pr(head_ref, issue_target)
-            if verify_error or verified_pr is None:
-                sys.stderr.write(f"publish_implementation_output: pr_unverified:{verify_error or 'matching_pr_missing'}\n")
-                record_publish_verification_retry(verified.job_dir, f"pr-unverified:{verify_error or 'matching_pr_missing'}")
-                return 2
-            pr_target = verified_pr
-            opened_pr = True
-        if not opened_pr:
-            updated = self._update_existing_implementation_pr(pr_target, action, issue_target)
-            if updated != 0:
-                record_publish_verification_retry(verified.job_dir, f"pr-update-failed:{updated}")
-                return updated
-        mark_publish_verification_published(verified.job_dir, pr_number=int(pr_target), remote_oid=verified.candidate_sha)
-        return self.dispatch_reviewers({"target_kind": "PR", "target_number": pr_target})
+            )
+        except (RuntimeError, OSError) as exc:
+            record_publish_verification_retry(verified.job_dir, f"topology-publication:{_single_line(str(exc))}")
+            sys.stderr.write(f"publish_implementation_output: topology publication failed: {_single_line(str(exc))}\n")
+            return 2
+        return self.dispatch_reviewers({"target_kind": "PR", "target_number": published.pr_number})
 
-    def _matching_current_implementation_pr(self, head_ref: str, issue_target: str, worktree: Path) -> int | None:
-        error, pr_target, pr_head_sha = self._matching_implementation_pr_with_head(head_ref, issue_target)
-        if error or pr_target is None:
-            return None
-        if not _is_full_sha(pr_head_sha):
-            return None
-        local = self._git_in(worktree, ["rev-parse", "HEAD"], check=False)
-        if local.returncode != 0:
-            return None
-        local_head = local.stdout.strip()
-        if not _is_full_sha(local_head):
-            return None
-        status = self._git_in(worktree, ["status", "--porcelain"], check=False)
-        if status.returncode != 0 or status.stdout.strip():
-            return None
-        remote_head = pr_head_sha
-        for _attempt in range(1):
-            if remote_head == local_head:
-                return pr_target
-            remote = self._git_in(worktree, ["rev-parse", "--verify", f"refs/remotes/origin/{head_ref}"], check=False)
-            remote_head = remote.stdout.strip() if remote.returncode == 0 else ""
-        if remote_head == local_head:
-            return pr_target
-        return None
-
-    def _update_existing_implementation_pr(
-        self,
-        pr_target: int,
-        action: Mapping[str, object],
-        issue_target: str,
-    ) -> int:
-        pr_target = str(pr_target)
-        admission = self._require_github_actor_admission_or_return("publish-implementation-output")
-        if admission is None:
-            return 3
-        denied = self._require_item_write_admission_or_return(
-            "publish-implementation-output",
-            "pr",
-            pr_target,
-            current_login=admission.login,
-        )
-        if denied is not None:
-            return denied
-        title = self._implementation_pr_title(action, issue_target)
-        body_file = self.ctx.durable_artifact_path(self._implementation_pr_body_file(action, issue_target))
-        result = self.gh(
-            ["pr", "edit", pr_target, "--title", title, "--body-file", body_file],
-            check=False,
-        )
-        if result.returncode != 0:
-            sys.stderr.write(f"publish_implementation_output: pr_update_failed: {_single_line(result.stderr or result.stdout)}\n")
-            return result.returncode or 2
-        return 0
-
-    def _validate_publish_implementation_identity(
-        self,
-        action: Mapping[str, object],
-        issue_target: str,
-        head_ref: str,
-        worktree: Path,
-    ) -> str | None:
-        marker = str(action.get("source_marker") or "")
-        marker_id = marker.removeprefix("IMPLEMENT_DONE:").removesuffix(":ok").strip(":")
-        candidate = marker_id.replace("_", "-").strip("-") or f"issue-{issue_target}"
-        expected_head = f"refactor/iter{issue_target}-{candidate}"
-        expected_worktree = (self.ctx.repo_root / ".worktrees" / f"iter{issue_target}-{candidate}").resolve()
-        if head_ref != expected_head or worktree.resolve() != expected_worktree:
-            return "noncanonical identity"
-        branch = self._git_in(worktree, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
-        if branch.returncode != 0 or branch.stdout.strip() != head_ref:
-            return "noncanonical branch"
-        return None
+    def _retire_superseded_pr(self, request: RetireSupersededPRRequest) -> RetireSupersededPRResult:
+        """Run the complete owner-private retirement transaction."""
+        return self._topology_authority().retire_superseded_pr(request)
 
     def _require_publish_implementation_diff(self, worktree: Path) -> int:
         diff = self._git_in(worktree, ["diff", "HEAD", "--quiet"], check=False)
@@ -1594,26 +1879,6 @@ class ControllerActions:
         )
         return result
 
-    def _push_verified_publish_sha(self, worktree: Path, candidate_sha: str, head_ref: str, job_dir: Path) -> int:
-        push = self._git_in(worktree, ["push", "origin", f"{candidate_sha}:refs/heads/{head_ref}"], check=False)
-        if push.stdout:
-            print(push.stdout, end="")
-        if push.stderr:
-            sys.stderr.write(push.stderr)
-        if push.returncode != 0:
-            record_publish_verification_retry(job_dir, f"push-failed:{push.returncode}")
-            return push.returncode
-        remote = self._git_in(worktree, ["ls-remote", "origin", f"refs/heads/{head_ref}"], check=False)
-        if remote.returncode != 0:
-            record_publish_verification_retry(job_dir, "remote-oid-unavailable")
-            return 3
-        remote_oid = (remote.stdout.split() or [""])[0]
-        if remote_oid != candidate_sha:
-            record_publish_verification_retry(job_dir, "remote-oid-mismatch")
-            sys.stderr.write("publish_implementation_output: remote_oid_mismatch_after_push\n")
-            return 3
-        return 0
-
     def dispatch_consensus_implementation(self, action: Mapping[str, object]) -> int:
         if not self._require_owner_or_return("dispatch-consensus-implementation", code=3):
             return 3
@@ -1664,7 +1929,7 @@ class ControllerActions:
             return phase_result
         cluster_id = str(action["cluster_id"])
         iteration = str(action["iteration"])
-        worktree, branch = self.fresh_safe_worktree(iteration, cluster_id, self.integration_branch)
+        worktree, branch = self._create_compliant_worktree(iteration, cluster_id, self.integration_branch)
         log = self.ctx.paths.logs / f"implement-{cluster_id}.log"
         self._clear_stale_implement_log_for_fresh_dispatch(log, action)
         prompt = self.ctx.paths.prompts / f"implement-{cluster_id}.md"
@@ -2327,8 +2592,7 @@ class ControllerActions:
         return {"head_ref": head_ref, "head_sha": str(payload.get("headRefOid") or ""), "base_ref": base_ref}
 
     def _ensure_managed_pr_worktree(self, head_ref: str) -> Path | None:
-        match = MANAGED_PR_HEAD_RE.fullmatch(head_ref)
-        if match is None:
+        if not self._canonical_managed_head(head_ref):
             sys.stderr.write(f"dispatch_pr_rebase_resolve: invalid managed head_ref {head_ref!r}\n")
             return None
         existing = self._worktree_for_branch(head_ref)
@@ -2338,21 +2602,14 @@ class ControllerActions:
                 return resolved
             sys.stderr.write("dispatch_pr_rebase_resolve: existing worktree outside controller-owned .worktrees\n")
             return None
-        wt_path = self.ctx.repo_root / ".worktrees" / f"iter{match.group(1)}-{match.group(2)}"
-        (self.ctx.repo_root / ".worktrees").mkdir(parents=True, exist_ok=True)
-        result = self.git(["worktree", "add", str(wt_path), head_ref], check=False)
-        if result.returncode != 0:
-            sys.stderr.write(f"dispatch_pr_rebase_resolve: worktree add failed: {_single_line(result.stderr or result.stdout)}\n")
-            return None
-        return wt_path.resolve()
+        sys.stderr.write("dispatch_pr_rebase_resolve: topology provenance has no attached worktree\n")
+        return None
 
     def _canonical_managed_head(self, head_ref: str) -> bool:
-        match = MANAGED_PR_HEAD_RE.fullmatch(head_ref)
-        if match is None:
+        identity = _controller_topology_identity_from_head(head_ref, 1)
+        if identity is None:
             return False
-        try:
-            _validate_safe_worktree_fields(match.group(1), match.group(2))
-        except ValueError:
+        if not controller_topology_branch_is_durable(self.repo_root, head_ref):
             return False
         return head_ref not in {self.integration_branch, self.review_base_branch}
 
@@ -2988,42 +3245,6 @@ class ControllerActions:
                 return current
         return None
 
-    def _write_branch_provenance(
-        self,
-        *,
-        branch: str,
-        worktree: Path,
-        issue: str,
-        base_sha: str,
-        actor_login: str | None = None,
-    ) -> None:
-        if not self._canonical_managed_head(branch):
-            return
-        resolved_actor_login = actor_login or ""
-        if actor_login is None:
-            actor = self.github_actor or GitHubAuthenticatedActor(self.ctx)
-            try:
-                admission = actor.require_admission("branch-provenance")
-            except RuntimeError:
-                admission = None
-            if isinstance(admission, GitHubActorAdmission):
-                resolved_actor_login = admission.login
-            elif admission is not None:
-                resolved_actor_login = str(getattr(admission, "login", "") or "")
-        path = self._branch_provenance_path(branch)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "branch": branch,
-            "worktree": str(worktree.resolve()),
-            "owner_device": self._current_owner_device(),
-            "github_login": resolved_actor_login,
-            "issue": issue,
-            "created_at": self._now(),
-            "base_sha": base_sha,
-            "authority": "local_admission_evidence_only_not_durable_claim",
-        }
-        path.write_text(json.dumps(payload, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-
     def _require_branch_push_admission_or_return(
         self,
         action: str,
@@ -3032,30 +3253,23 @@ class ControllerActions:
         *,
         current_login: str = "",
     ) -> int | None:
-        if not self._canonical_managed_head(branch):
+        identity = _controller_topology_identity_from_head(branch, 1)
+        if identity is None:
+            if parse_legacy_implementation_head_evidence(branch) is not None:
+                self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:legacy-topology-head")
+                return 2
             return None
         if branch in {self.integration_branch, self.review_base_branch} or branch.startswith(ROLLUP_HEAD_PREFIX):
             self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:protected-branch")
             sys.stderr.write(f"push_ownership_guard:{action}: protected branch {branch}\n")
             return 2
-        admission_login = current_login or self._github_login_for_action(action)
-        if not admission_login:
-            self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:github-login-unavailable")
-            sys.stderr.write(f"push_ownership_guard:{action}: github login unavailable\n")
-            return 3
-        provenance = self._read_branch_provenance(branch)
+        provenance = self._topology_read_provenance(f"publication:{branch}")
         if provenance is None:
-            self._backfill_legacy_branch_provenance(branch=branch, worktree=worktree, actor_login=admission_login)
-            provenance = self._read_branch_provenance(branch)
-            if provenance is None:
-                self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:missing-provenance")
-                sys.stderr.write(f"push_ownership_guard:{action}: missing provenance for {branch}\n")
-                return 2
-        current_owner = self._current_owner_device()
+            self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:missing-topology-provenance")
+            return 2
         if (
-            provenance.get("branch") != branch
-            or str(provenance.get("owner_device") or "") != current_owner
-            or str(provenance.get("worktree") or "") != str(worktree.resolve())
+            provenance.branch != branch
+            or provenance.worktree != str(worktree.resolve())
         ):
             self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:provenance-mismatch")
             sys.stderr.write(f"push_ownership_guard:{action}: provenance mismatch for {branch}\n")
@@ -3065,47 +3279,7 @@ class ControllerActions:
             self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:worktree-branch-mismatch:{actual_branch}")
             sys.stderr.write(f"push_ownership_guard:{action}: worktree branch mismatch {actual_branch!r}\n")
             return 2
-        author = self._open_pr_author_for_head(branch)
-        if author is None:
-            self._append_pending_event(f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:branch-pr-author-unavailable")
-            sys.stderr.write(f"push_ownership_guard:{action}: open PR author unavailable for {branch}\n")
-            return 3
-        if author and author != admission_login:
-            self._append_pending_event(
-                f"PUSH_OWNERSHIP_BLOCKED:{action}:{branch}:branch_pr_author_mismatch:current={admission_login}:author={author}"
-            )
-            sys.stderr.write(f"push_ownership_guard:{action}: branch_pr_author_mismatch current={admission_login} author={author}\n")
-            return 2
         return None
-
-    def _backfill_legacy_branch_provenance(self, *, branch: str, worktree: Path, actor_login: str) -> None:
-        match = MANAGED_PR_HEAD_RE.fullmatch(branch)
-        if match is None:
-            return
-        issue = match.group(1)
-        cluster = match.group(2)
-        if cluster != f"issue-{issue}":
-            return
-        expected_worktree = (self.ctx.repo_root / ".worktrees" / f"iter{issue}-{cluster}").resolve()
-        if worktree.resolve() != expected_worktree:
-            return
-        if self._current_branch(worktree) != branch:
-            return
-        if not self._live_target_has_managed_label(kind="issue", target=issue):
-            return
-        self._write_branch_provenance(branch=branch, worktree=worktree, issue=issue, base_sha="", actor_login=actor_login)
-
-    def _read_branch_provenance(self, branch: str) -> dict[str, object] | None:
-        path = self._branch_provenance_path(branch)
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    def _branch_provenance_path(self, branch: str) -> Path:
-        safe = branch.replace("/", "__")
-        return self.ctx.paths.state / "branch-provenance" / f"{safe}.json"
 
     def _open_pr_author_for_head(self, branch: str) -> str | None:
         result = self.gh(["pr", "list", "--state", "open", "--head", branch, "--json", "author,headRefName"], check=False)
@@ -3336,6 +3510,15 @@ def _line_count(value: str) -> int:
     return len(str(value or "").splitlines())
 
 
+def _flatten_gh_pages(value: object) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    pages = value if isinstance(value, list) else []
+    for page in pages:
+        candidates = page if isinstance(page, list) else [page]
+        rows.extend(item for item in candidates if isinstance(item, dict))
+    return rows
+
+
 def _format_key_value_suffix(fields: Mapping[str, object]) -> str:
     return " ".join(f"{key}={json.dumps(str(value), ensure_ascii=False)}" for key, value in fields.items())
 
@@ -3362,6 +3545,17 @@ def _safe_branch_name(value: str) -> bool:
 
 def _is_full_sha(value: str) -> bool:
     return bool(re.fullmatch(r"[0-9a-f]{40}", value.strip()))
+
+
+def _controller_topology_identity_from_head(value: str, issue_number: int) -> ControllerTopologyIdentity | None:
+    match = re.fullmatch(r"(feat|fix|refactor|docs|test|chore)/(\d{4}-\d{2}-\d{2})_([a-z0-9]+(?:-[a-z0-9]+)*)", value)
+    if match is None:
+        return None
+    try:
+        branch_date = date.fromisoformat(match.group(2))
+    except ValueError:
+        return None
+    return ControllerTopologyIdentity(issue_number, match.group(3), match.group(1), branch_date)  # type: ignore[arg-type]
 
 
 def _implementation_cluster_id(action: Mapping[str, object], issue_target: str) -> str:

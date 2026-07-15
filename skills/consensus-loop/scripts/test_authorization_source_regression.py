@@ -21,13 +21,12 @@ def read(path: Path) -> str:
 
 
 class AuthorizationSourceRegressionTests(unittest.TestCase):
-    def test_current_pr_noop_boundary_is_documented_without_new_authority(self) -> None:
+    def test_current_pr_adoption_boundary_is_documented_without_new_authority(self) -> None:
         combined = "\n".join((read(SKILL_MD), read(RUNTIME_EXCEPTIONS)))
         for needle in (
-            "`suppressed_reason=pr_already_open_current`",
-            "returns 0 before diff/build/test/push/PR edit/reviewer dispatch",
-            "Remote ref proof is read-only and bounded",
-            "unknown or not-current evidence falls through to the existing publish path and is not success authority",
+            "existing canonical PR is never standalone completion authority",
+            "only inside `publish_exact_head`",
+            "`PUBLICATION_RECEIPT_FINALIZED`",
             "no public command bus",
             "no generic command fields",
             "no generic lifecycle actor",
@@ -35,24 +34,24 @@ class AuthorizationSourceRegressionTests(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, combined)
 
-    def test_current_pr_noop_has_planner_and_helper_behavior_surfaces(self) -> None:
+    def test_current_pr_adoption_has_complete_transaction_surfaces(self) -> None:
         wakeup_plan = read(WAKEUP_PLAN)
         controller_actions = read(CONTROLLER_ACTIONS)
         for needle in (
-            "pr_already_open_current",
             "_current_implementation_pr_proof",
             "IMPLEMENTATION_PR_HEAD_VISIBILITY_ATTEMPTS",
+            "legacy_implementation_pr_evidence_missing_or_ambiguous",
         ):
             with self.subTest(planner=needle):
                 self.assertIn(needle, wakeup_plan)
         for needle in (
-            "_matching_current_implementation_pr",
-            '["rev-parse", "HEAD"]',
-            '["rev-parse", "--verify", f"refs/remotes/origin/{head_ref}"]',
+            ".publish_exact_head(",
+            "PublishExactHeadRequest(",
             "return self.dispatch_reviewers",
         ):
             with self.subTest(helper=needle):
                 self.assertIn(needle, controller_actions)
+        self.assertNotIn("_matching_current_implementation_pr", controller_actions)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,21 @@ from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CLI = SCRIPT_DIR / "consensus-rnd-cli"
+from codex_refactor_loop.controller_topology_authority import TopologyPhase, TopologyProvenance
+
+
+def _write_publication_topology(repo: Path, issue: int) -> None:
+    branch = f"refactor/2026-07-15_issue-{issue}"
+    record = TopologyProvenance(
+        f"publication:{branch}", TopologyPhase.WORKTREE_CREATED, 2, "", issue, f"issue-{issue}",
+        "refactor", "2026-07-15", branch, str(repo / ".worktrees" / branch.replace("/", "__")),
+        "origin/dev", "b" * 40,
+    ).exact()
+    topology = repo / ".refactor-loop/state/controller-topology"
+    topology.mkdir(parents=True, exist_ok=True)
+    (topology / f"publication__{branch.replace('/', '__')}.json").write_text(
+        json.dumps({**record.payload(), "digest": record.digest}), encoding="utf-8"
+    )
 
 
 class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
@@ -39,6 +54,7 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
         self.ctx = LoopContext.load(repo_root=self.repo, env=os.environ)
         self.monitor = ConcurrencyMonitor(self.ctx)
         self.refactor_loop = self.repo / ".refactor-loop"
+        _write_publication_topology(self.repo, 581)
 
     def tearDown(self) -> None:
         os.environ.clear()
@@ -347,7 +363,8 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
 
     def test_compute_expected_suppresses_empty_scoped_diff_implementation_completion(self) -> None:
         (self.refactor_loop / "logs").mkdir(parents=True, exist_ok=True)
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-581"
+        worktree.mkdir(parents=True)
         (self.refactor_loop / "logs" / "implement-issue-581.log").write_text(
             "no code change required\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n",
             encoding="utf-8",
@@ -360,7 +377,8 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
                 "human": self.labels.HUMAN_AUTO,
                 "labels": [self.labels.MANAGED, self.labels.PHASE_IMPLEMENTING, self.labels.HUMAN_AUTO],
                 "body": "",
-                "head_ref": "",
+                "head_ref": "refactor/2026-07-15_issue-581",
+                "worktree": str(worktree),
                 "is_draft": False,
                 "state": "open",
             }
@@ -368,7 +386,7 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
 
         def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
             if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                return subprocess.CompletedProcess(command, 0, "refactor/iter581-issue-581\n", "")
+                return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-581\n", "")
             if command[-3:] == ["merge-base", "HEAD", "origin/integration"]:
                 return subprocess.CompletedProcess(command, 0, "old-base\n", "")
             if command[-2:] == ["--verify", "origin/integration"]:
@@ -390,7 +408,8 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
 
     def test_compute_expected_suppresses_publish_ready_implementation_completion(self) -> None:
         (self.refactor_loop / "logs").mkdir(parents=True, exist_ok=True)
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-581"
+        worktree.mkdir(parents=True)
         (self.refactor_loop / "logs" / "implement-issue-581.log").write_text(
             "implementation ready for publish\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n",
             encoding="utf-8",
@@ -403,7 +422,8 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
                 "human": self.labels.HUMAN_AUTO,
                 "labels": [self.labels.MANAGED, self.labels.PHASE_IMPLEMENTING, self.labels.HUMAN_AUTO],
                 "body": "",
-                "head_ref": "",
+                "head_ref": "refactor/2026-07-15_issue-581",
+                "worktree": str(worktree),
                 "is_draft": False,
                 "state": "open",
             }
@@ -411,7 +431,7 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
 
         def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
             if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                return subprocess.CompletedProcess(command, 0, "refactor/iter581-issue-581\n", "")
+                return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-581\n", "")
             if command[-3:] == ["merge-base", "HEAD", "origin/integration"]:
                 return subprocess.CompletedProcess(command, 0, "base\n", "")
             if command[-2:] == ["--verify", "origin/integration"]:
@@ -1122,7 +1142,10 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
         ]
         logs = self.refactor_loop / "logs"
         logs.mkdir(parents=True, exist_ok=True)
-        (self.repo / ".worktrees" / "iter581-issue-581").mkdir(parents=True)
+        worktree = self.repo / ".worktrees" / "refactor__2026-07-15_issue-581"
+        worktree.mkdir(parents=True)
+        items[0]["head_ref"] = "refactor/2026-07-15_issue-581"
+        items[0]["worktree"] = str(worktree)
         (logs / "implement-issue-581.log").write_text(
             "implementation ready for publish\nIMPLEMENT_DONE:issue-581:ok\nEXIT=0\n",
             encoding="utf-8",
@@ -1130,7 +1153,7 @@ class ConcurrencyMonitorDispatchQueueTests(unittest.TestCase):
 
         def runner(command: list[str], **_: object) -> subprocess.CompletedProcess[str]:
             if command[-2:] == ["--abbrev-ref", "HEAD"]:
-                return subprocess.CompletedProcess(command, 0, "refactor/iter581-issue-581\n", "")
+                return subprocess.CompletedProcess(command, 0, "refactor/2026-07-15_issue-581\n", "")
             if command[-2:] == ["status", "--porcelain"]:
                 return subprocess.CompletedProcess(command, 0, "M  touched.py\n", "")
             return subprocess.CompletedProcess(command, 0, "", "")

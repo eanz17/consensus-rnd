@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +25,12 @@ from .consensus_gate import (
 )
 from .context import LoopContext, LoopContextError
 from .controller_actions import ControllerActions
+from .controller_topology_authority import (
+    RetireSupersededPRRequest,
+    ReviewGateProjection,
+    SUPERSESSION_SENTINEL,
+    TopologyPhase,
+)
 from .cross_instance_stand_down import check_cross_instance_admission
 from .default_issue_intake_admission import (
     ADMISSION_PRECONDITIONS,
@@ -729,7 +737,7 @@ class WakeupRunner:
             if repair_error:
                 return repair_error
         log = Path(str(action.get("log") or ""))
-        if self._spawn_log_suppresses_retry(log):
+        if self._spawn_log_suppresses_retry(log, action):
             return "target_log_exists"
         return None
 
@@ -1500,7 +1508,7 @@ class WakeupRunner:
         if not self._live_target_has_managed_label("pr", target):
             return "dispatch_pr_rebase_resolve_target_not_managed"
         head_ref = str(action.get("head_ref") or "").strip()
-        if not _managed_pr_head_ref(head_ref):
+        if not re.fullmatch(r"(?:feat|fix|refactor|docs|test|chore)/\d{4}-\d{2}-\d{2}_[a-z0-9]+(?:-[a-z0-9]+)*", head_ref):
             return "dispatch_pr_rebase_resolve_invalid_head_ref"
         live_head = self._pr_head_ref(target)
         if live_head != head_ref:
@@ -1526,7 +1534,7 @@ class WakeupRunner:
         if not self._live_target_has_managed_label("pr", target):
             return "commit_push_resolved_pr_rebase_target_not_managed"
         head_ref = str(action.get("head_ref") or "").strip()
-        if not _managed_pr_head_ref(head_ref):
+        if not re.fullmatch(r"(?:feat|fix|refactor|docs|test|chore)/\d{4}-\d{2}-\d{2}_[a-z0-9]+(?:-[a-z0-9]+)*", head_ref):
             return "commit_push_resolved_pr_rebase_invalid_head_ref"
         live_head = self._pr_head_ref(target)
         if live_head != head_ref:
@@ -1625,9 +1633,13 @@ class WakeupRunner:
             worktree.resolve().relative_to((self.ctx.repo_root / ".worktrees").resolve())
         except ValueError:
             return "publish_implementation_worktree_outside_controller_owned_root"
-        identity_error = self._validate_canonical_implementation_identity(action, worktree, head_ref)
-        if identity_error:
-            return identity_error
+        if not re.fullmatch(r"(?:feat|fix|refactor|docs|test|chore)/\d{4}-\d{2}-\d{2}_[a-z0-9]+(?:-[a-z0-9]+)*", head_ref):
+            return "publish_implementation_noncanonical_identity"
+        if worktree.resolve().name != head_ref.replace("/", "__"):
+            return "publish_implementation_noncanonical_identity"
+        branch = self.command_runner(["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"])
+        if branch.returncode != 0 or branch.stdout.strip() != head_ref:
+            return "publish_implementation_noncanonical_identity"
         status = self.command_runner(["git", "-C", str(worktree), "status", "--porcelain"])
         if status.returncode != 0:
             return "publish_implementation_diff_unavailable"
@@ -1645,22 +1657,6 @@ class WakeupRunner:
             return "publish_implementation_empty_scoped_diff"
         if diff.returncode != 1:
             return "publish_implementation_diff_unavailable"
-        return None
-
-    def _validate_canonical_implementation_identity(self, action: Mapping[str, Any], worktree: Path, head_ref: str) -> str | None:
-        target = action.get("target_number")
-        if not isinstance(target, int):
-            return "publish_implementation_target_missing"
-        marker = str(action.get("source_marker") or "")
-        marker_id = marker.removeprefix("IMPLEMENT_DONE:").removesuffix(":ok").strip(":")
-        candidate = marker_id.replace("_", "-").strip("-") or f"issue-{target}"
-        expected_head = f"refactor/iter{target}-{candidate}"
-        expected_worktree = (self.ctx.repo_root / ".worktrees" / f"iter{target}-{candidate}").resolve()
-        if head_ref != expected_head or worktree.resolve() != expected_worktree:
-            return "publish_implementation_noncanonical_identity"
-        branch = self.command_runner(["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"])
-        if branch.returncode != 0 or branch.stdout.strip() != head_ref:
-            return "publish_implementation_noncanonical_identity"
         return None
 
     def _dispatch(self, controller_action: str, action: Mapping[str, Any]) -> int:
@@ -1704,6 +1700,41 @@ class WakeupRunner:
             if decision["decision"] == "FIX":
                 return self._dispatch_review_fix(int(action["target_number"]))
             if decision["decision"] in {"MERGE", "MERGE_WITH_COMMENTS"}:
+                old_pr = action.get("superseded_pr_number")
+                linked_issue = action.get("linked_issue")
+                supersession_body = str(action.get("supersession_body") or "")
+                gate = decision.get("gate") if isinstance(decision.get("gate"), Mapping) else {}
+                live_head = str(gate.get("live_head_sha") or "")
+                if (
+                    not isinstance(old_pr, int)
+                    or not isinstance(linked_issue, int)
+                    or supersession_body.count(SUPERSESSION_SENTINEL) != 1
+                ):
+                    return 2
+                review_projection = self.actions._topology_review_projection(
+                    int(action["target_number"]),
+                    live_head,
+                    str(decision["decision"]),
+                )
+                with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+                    handle.write(supersession_body)
+                    body_file = Path(handle.name)
+                try:
+                    retired = self.actions._retire_superseded_pr(
+                        RetireSupersededPRRequest(
+                            old_pr_number=old_pr,
+                            replacement_pr_number=int(action["target_number"]),
+                            linked_issue_number=linked_issue,
+                            final_sha=live_head,
+                            base_branch=str(action.get("base_ref") or self.ctx.host_env.get("INTEGRATION_BRANCH") or ""),
+                            review=review_projection,
+                            supersession_body_file=body_file,
+                        )
+                    )
+                finally:
+                    body_file.unlink(missing_ok=True)
+                if retired.phase is not TopologyPhase.OLD_PR_CLOSED:
+                    return 2
                 merge_rc = self.actions.merge_pr(str(action["target_number"]))
                 if merge_rc == 0 and isinstance(action.get("target_number"), int):
                     self._same_tick_terminal_prs.add(int(action["target_number"]))
@@ -1855,9 +1886,14 @@ class WakeupRunner:
         except Exception:
             return None
 
-    def _spawn_log_suppresses_retry(self, log: Path) -> bool:
+    def _spawn_log_suppresses_retry(self, log: Path, action: Mapping[str, Any]) -> bool:
         if is_implement_log(log):
-            state = classify_implement_attempt(repo_root=self.ctx.repo_root, log_path=log, command_runner=self.command_runner)
+            state = classify_implement_attempt(
+                repo_root=self.ctx.repo_root,
+                action=action,
+                log_path=log,
+                command_runner=self.command_runner,
+            )
             return state.in_flight or state.publish_ready or implement_attempt_is_terminal_or_noop_completion(state)
         return _spawn_log_suppresses_retry(log)
 
@@ -2552,7 +2588,12 @@ class WakeupRunner:
         if not log.is_absolute() or not log.exists():
             return "target-log-absent"
         if is_implement_log(log):
-            state = classify_implement_attempt(repo_root=self.ctx.repo_root, log_path=log, command_runner=self.command_runner)
+            state = classify_implement_attempt(
+                repo_root=self.ctx.repo_root,
+                action=action,
+                log_path=log,
+                command_runner=self.command_runner,
+            )
             if state.redispatch and not implement_attempt_is_terminal_or_noop_completion(state):
                 return f"target-log-redispatchable:{state.reason}"
             return ""
@@ -2768,10 +2809,6 @@ def _target_from_text(text: str) -> tuple[str, int] | None:
         if match:
             return kind, int(match.group(1))
     return None
-
-
-def _managed_pr_head_ref(value: str) -> bool:
-    return bool(re.fullmatch(r"refactor/iter[1-9][0-9]*-[A-Za-z0-9._-]+", value))
 
 
 def _unblocks_pr_mergeability(action: Mapping[str, Any]) -> bool:

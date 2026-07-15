@@ -17,6 +17,11 @@ sys.path.insert(0, str(SCRIPT_DIR))
 from codex_refactor_loop.context import LoopContext
 from codex_refactor_loop import labels
 from codex_refactor_loop.controller_actions import ControllerActions
+from codex_refactor_loop.controller_topology_authority import (
+    RetireSupersededPRResult,
+    ReviewGateProjection,
+    TopologyPhase,
+)
 from codex_refactor_loop.cross_instance_stand_down import CrossInstanceAdmission
 from codex_refactor_loop.github_actor import GitHubActorAdmission
 from codex_refactor_loop.wakeup_plan import GhItem, completed_marker_actions
@@ -32,6 +37,7 @@ class FakeActions:
         self.repo = repo
         self.merged: list[str] = []
         self.rendered_fixes: list[tuple[int, int]] = []
+        self.retired: list[tuple[int, int]] = []
         self.github_actor = self
 
     def require_admission(self, action: str) -> GitHubActorAdmission:
@@ -41,8 +47,19 @@ class FakeActions:
         return CrossInstanceAdmission("allowed", "test-allowed")
 
     def merge_pr(self, pr: str, linked_issue: str = "") -> int:
+        if not self.retired:
+            raise AssertionError("replacement merge must follow retirement")
         self.merged.append(pr)
         return 0
+
+    def _topology_review_projection(self, pr_number: int, head_sha: str, decision: str):
+        return ReviewGateProjection(decision, pr_number, head_sha, "evidence-digest")
+
+    def _retire_superseded_pr(self, request):
+        self.retired.append((request.old_pr_number, request.replacement_pr_number))
+        return RetireSupersededPRResult(
+            request.old_pr_number, request.replacement_pr_number, TopologyPhase.OLD_PR_CLOSED, "comment"
+        )
 
     def render_review_fix_prompt(self, pr_number: int, round_number: int):
         self.rendered_fixes.append((pr_number, round_number))
@@ -118,6 +135,16 @@ class ReviewGateEndToEndTests(unittest.TestCase):
                 labels=("crnd:lifecycle:managed", "crnd:phase:reviewing", "crnd:human:auto"),
                 head_ref="impl/pr480",
                 head_sha=HEAD_SHA,
+                body="Closes #2737",
+            ),
+            GhItem(
+                kind="PR",
+                number=479,
+                title="legacy implementation",
+                labels=("crnd:lifecycle:managed", "crnd:phase:reviewing", "crnd:human:auto"),
+                head_ref="refactor/iter2737-controller-topology",
+                head_sha=HEAD_SHA,
+                body="Closes #2737",
             )
         ]
         actions = completed_marker_actions(self.repo, ctx=self.ctx, open_targets={("PR", 480)}, gh_items=gh_items)
@@ -270,19 +297,28 @@ class ReviewGateEndToEndTests(unittest.TestCase):
 
         with mock.patch.object(real_actions, "gh", side_effect=fake_gh):
             with mock.patch.object(real_actions, "git", side_effect=AssertionError("git should not be called")):
-                runner = WakeupRunner(
-                    self.ctx,
-                    plan_loader=lambda _repo: {
-                        "schema": "wakeup-plan",
-                        "mode": "closed-action-projection",
-                        "apply_authority": "wakeup-runner-396-only",
-                        "no_lifecycle_authority": True,
-                        "actions": [action],
-                    },
-                    actions=real_actions,
-                    command_runner=lambda command: self._review_gate_command(command, is_draft=True),
-                )
-                result = runner.run_once()[0]
+                with mock.patch.object(
+                    real_actions,
+                    "_topology_review_projection",
+                    return_value=ReviewGateProjection("MERGE_WITH_COMMENTS", 480, HEAD_SHA, "evidence-digest"),
+                ), mock.patch.object(
+                    real_actions,
+                    "_retire_superseded_pr",
+                    return_value=RetireSupersededPRResult(479, 480, TopologyPhase.OLD_PR_CLOSED, "comment"),
+                ):
+                    runner = WakeupRunner(
+                        self.ctx,
+                        plan_loader=lambda _repo: {
+                            "schema": "wakeup-plan",
+                            "mode": "closed-action-projection",
+                            "apply_authority": "wakeup-runner-396-only",
+                            "no_lifecycle_authority": True,
+                            "actions": [action],
+                        },
+                        actions=real_actions,
+                        command_runner=lambda command: self._review_gate_command(command, is_draft=True),
+                    )
+                    result = runner.run_once()[0]
 
         self.assertEqual(result.status, "applied")
         ready_index = gh_calls.index(["pr", "ready", "480"])

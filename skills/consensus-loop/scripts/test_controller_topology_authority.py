@@ -693,6 +693,45 @@ class AuthorityTests(unittest.TestCase):
         self.assertNotIn("EFFECT:close", self.port.calls)
         self.port._topology_post_supersession = original
 
+    def test_supersession_postproof_races_preserve_prepared_and_retry_adopts_comment(self):
+        rows = {
+            "linked-issue-closed": lambda snapshot: replace(snapshot, linked_issue_state="CLOSED"),
+            "replacement-closed": lambda snapshot: replace(
+                snapshot, replacement=replace(snapshot.replacement, state="CLOSED")),
+            "replacement-equivalence-changed": lambda snapshot: replace(
+                snapshot, replacement=replace(snapshot.replacement, diff_digest="changed")),
+            "review-decision-changed": lambda snapshot: replace(
+                snapshot, review=replace(snapshot.review, decision="MERGE")),
+        }
+        for label, mutate in rows.items():
+            with self.subTest(row=label):
+                port = FakePort(Path(self.temp.name))
+                owner = ControllerTopologyAuthority(port)
+                request = replace(self.retire, review=port.review)
+                original_post = port._topology_post_supersession
+
+                def post_then_mutate(post_request, sentinel_digest, *, mutation=mutate):
+                    result = original_post(post_request, sentinel_digest)
+                    port.retirement_override = mutation
+                    return result
+
+                port._topology_post_supersession = post_then_mutate
+                with self.assertRaises(ControllerTopologyError):
+                    owner.retire_superseded_pr(request)
+
+                record = next(iter(port.records.values()))
+                self.assertEqual(TopologyPhase.RETIREMENT_PREPARED, record.phase)
+                self.assertEqual(1, port.calls.count("EFFECT:comment"))
+                self.assertEqual(0, port.calls.count("EFFECT:close"))
+                self.assertEqual(0, port.calls.count("CAS:SUPERSESSION_POSTED"))
+
+                port.retirement_override = None
+                port.calls.clear()
+                result = owner.retire_superseded_pr(request)
+                self.assertEqual(TopologyPhase.OLD_PR_CLOSED, result.phase)
+                self.assertEqual(0, port.calls.count("EFFECT:comment"))
+                self.assertEqual(1, port.calls.count("EFFECT:close"))
+
     def test_publication_terminal_reentry_reproves_live_diff_without_effect_or_cas(self):
         self._created()
         self.owner.publish_exact_head(self.publish)

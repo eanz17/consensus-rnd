@@ -549,6 +549,9 @@ class ControllerTopologyAuthority:
                 self._fresh("supersession comment effect")
                 self._port._topology_post_supersession(request, record.sentinel_digest)
                 snapshot = self._port._topology_read_retirement(request, record.sentinel_digest)
+                post_equivalence = self._validate_retirement_snapshot(snapshot, request, allow_closed=False)
+                if post_equivalence != record.equivalence_digest:
+                    raise ControllerTopologyError("retirement evidence changed after supersession post")
                 if len(snapshot.sentinel_urls) != 1:
                     raise ControllerTopologyError("supersession sentinel postproof failed")
                 sentinel = snapshot.sentinel_urls[0]

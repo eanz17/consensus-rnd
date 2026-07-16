@@ -1,0 +1,77 @@
+{
+  "cleanup_restore_commit": "8152289d456f178636483a3921efe5b7067fdbe4",
+  "reviewed_content_sha256": "78b3f94957ee4c632729725bd920be16c54e2bed6232bb722ca67fb21acc1022",
+  "future_occurrence_path": "skills/consensus-loop/authorizations/issue-2737-reselection.json",
+  "temporary_whole_files": [
+    "skills/consensus-loop/scripts/codex_refactor_loop/issue_2737_recovery.py",
+    "skills/consensus-loop/scripts/test_issue_2737_recovery.py",
+    "skills/consensus-loop/scripts/test_issue_2737_cleanup_contract.py",
+    "skills/consensus-loop/scripts/fixtures/issue_2737_pr_a_cleanup_contract.json"
+  ],
+  "temporary_controller_imports": ["from .pr_checks import PrMergeReadinessProjection"],
+  "temporary_controller_members": [
+    "recover_issue_2737_partial_decomposition",
+    "_validate_issue_2737_occurrence",
+    "_revalidate_issue_2737_effect_admission",
+    "_issue_2737_live_observation",
+    "_issue_2737_pr_readiness",
+    "_issue_2737_pr_binding_projection",
+    "_issue_2737_review_projection",
+    "_issue_2737_decomposition_projection",
+    "_issue_2737_target_projection"
+  ],
+  "temporary_anchors": {
+    "skills/consensus-loop/SKILL.md": "issue-2737-partial-decomposition-recovery",
+    "skills/consensus-loop/authorizations/runtime-exceptions.md": "issue-2737-partial-decomposition-recovery"
+  },
+  "temporary_anchor_allowance": {
+    "path": "skills/consensus-loop/scripts/test_skill_reference_anchors.py",
+    "value": "issue_2737_recovery.py"
+  },
+  "incident_module_imports": [
+    "from __future__ import annotations",
+    "import json",
+    "import hashlib",
+    "import re",
+    "from dataclasses import dataclass",
+    "from datetime import datetime, timezone",
+    "from enum import Enum",
+    "from typing import Any, Mapping, Sequence"
+  ],
+  "incident_module_symbols": [
+    "Issue2737RecoveryBlocked", "Issue2737Effect", "Issue2737Occurrence", "Issue2737Binding",
+    "_blocked", "_exact_keys", "_reject_forbidden", "_positive_int", "_string", "_hex", "_tuple",
+    "_validate_reactions", "_validate_comment", "_validate_issue_baseline", "_validate_nested_record",
+    "parse_occurrence_record", "_pairs_without_duplicates", "validate_singleton_pr_b_changes", "next_effect",
+    "binding_from_observation", "validate_live_occurrence", "acquire_live_observation", "literal_effect_target",
+    "_sha256_text", "_flatten_pages", "_live_issue", "_reaction_facts", "_comment_facts",
+    "_baseline_issue_matches", "_effect_requests", "read_target_projection", "LiteralIssue2737Port",
+    "Issue2737Recovery"
+  ],
+  "effects": ["M2775", "O2772", "X2772", "M2776", "O2773", "X2773", "M2777", "O2774", "X2774"],
+  "targets": [2775, 2772, 2772, 2776, 2773, 2773, 2777, 2774, 2774],
+  "comment_body_sha256": [
+    "80202680a3e1f3692d14886ffee7834c4e784da4b022adbfbda5d7f9a65154d1",
+    "635645dca2d17a7ce33fe673ec9fb57221cd88c50bf47fb43b8d7fec32ff8340",
+    "25914ff1cf48aaa66302d1bae2457e44ff2e520132e851cef2e13604f2c28ca1",
+    "fcd8bbd0c422e9ca90b5fada6c5cc18a2bd9df4d8c11565866619d06bbd883af",
+    "983fbdb39c0fcde4f44adb86c3ac22cd8f8984d09cc7c59a727dbeadd506393d",
+    "8fc7bc659911be6908f096546b9cf2eb723e7c3f59d0694c31c5c7eee9726646"
+  ],
+  "retained_generic_sha256": {
+    "skills/consensus-loop/scripts/codex_refactor_loop/controller_actions.py": "0260093b5d32ae0c6237da37486fe3c62bb9104624c6cf92eb1a13c35daf152e",
+    "skills/consensus-loop/scripts/codex_refactor_loop/issue_decomposition.py": "2b53848c63025630651ef9519639f7ae52a38aa69e25d766d06ae1e41e46ec46",
+    "skills/consensus-loop/scripts/test_controller_actions.py": "6476eac456a8adb14605723c9f06ce257c0f4641d1cc68a05e3eee761443ae02"
+  },
+  "restored_base_sha256": {
+    "skills/consensus-loop/SKILL.md": "13d08dbea72c18e392bedeb9eb519cd791c4a05ec943f440cf3932ffe73d7fcf",
+    "skills/consensus-loop/authorizations/runtime-exceptions.md": "7879fd2aa3ac76571878c6a8743e1a4572292984791748b336cf65dc9280c9c0",
+    "skills/consensus-loop/scripts/test_skill_reference_anchors.py": "967c89f08fec25ea1f720328e2f1b072f0b36f54c1003c3208e1c63830ed6bbd"
+  },
+  "forbidden_route_owners": [
+    "skills/consensus-loop/scripts/codex_refactor_loop/cli.py",
+    "skills/consensus-loop/scripts/codex_refactor_loop/wakeup_plan.py",
+    "skills/consensus-loop/scripts/codex_refactor_loop/wakeup_runner.py",
+    "skills/consensus-loop/scripts/codex_refactor_loop/runtime_copy.py"
+  ]
+}

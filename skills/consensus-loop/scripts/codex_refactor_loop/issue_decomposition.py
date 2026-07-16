@@ -116,6 +116,63 @@ class IssueDecompositionTrackingProjection:
     conflicts: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class IssueDecompositionChildCreate:
+    child: IssueDecompositionChild
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class IssueDecompositionApplyProjection:
+    """Complete owner-local description of the writes ordinary #403 would make."""
+
+    children: tuple[IssueDecompositionTrackingChild, ...]
+    creates: tuple[IssueDecompositionChildCreate, ...]
+    parent_comment_required: bool
+    invalidate_snapshot: bool
+    conflicts: tuple[str, ...] = ()
+
+    @property
+    def is_noop(self) -> bool:
+        return not self.creates and not self.parent_comment_required and not self.invalidate_snapshot and not self.conflicts
+
+
+def build_issue_decomposition_apply_projection(
+    plan: IssueDecompositionPlan,
+    digest: str,
+    tracking: IssueDecompositionTrackingProjection,
+    existing: Mapping[str, IssueDecompositionTrackingChild],
+    *,
+    live_duplicate: Callable[[str, str], IssueDecompositionTrackingChild | None],
+) -> IssueDecompositionApplyProjection:
+    """Build the same immutable write plan consumed by ordinary apply and recovery."""
+
+    try:
+        tracked = reconcile_issue_decomposition_tracking_children(plan, digest, tracking)
+    except IssueDecompositionError as exc:
+        return IssueDecompositionApplyProjection((), (), False, False, (str(exc),))
+    children = dict(tracked)
+    children.update(existing)
+    creates: list[IssueDecompositionChildCreate] = []
+    for child in plan.children:
+        if child.slug in children:
+            continue
+        fingerprint = issue_decomposition_child_fingerprint(plan.parent_issue, digest, child.slug)
+        duplicate = live_duplicate(child.slug, fingerprint)
+        if duplicate is not None:
+            children[child.slug] = duplicate
+        else:
+            creates.append(IssueDecompositionChildCreate(child, fingerprint))
+    complete_tracking = not creates and set(tracked) == {child.slug for child in plan.children}
+    ordered = tuple(children[child.slug] for child in plan.children if child.slug in children)
+    return IssueDecompositionApplyProjection(
+        children=ordered,
+        creates=tuple(creates),
+        parent_comment_required=not complete_tracking,
+        invalidate_snapshot=bool(creates),
+    )
+
+
 def load_issue_decomposition_plan(ctx: LoopContext, plan_path: str | Path) -> IssueDecompositionPlan:
     path = _resolve_input_path(ctx, plan_path)
     try:

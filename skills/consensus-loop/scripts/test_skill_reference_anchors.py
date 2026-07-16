@@ -1491,6 +1491,7 @@ class SkillReferenceAnchorTests(unittest.TestCase):
             "phase9-issue": {
                 "controller_actions.py",
                 "git.py",
+                "issue_2737_recovery.py",
                 "monitors/progress.py",
                 "monitors/concurrency.py",
                 "peek.py",

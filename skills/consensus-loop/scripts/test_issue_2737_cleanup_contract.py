@@ -14,7 +14,8 @@ from unittest import mock
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[2]
-CONTRACT = json.loads((SCRIPT_DIR / "fixtures/issue_2737_pr_a_cleanup_contract.json").read_text(encoding="utf-8"))
+CONTRACT_PATH = SCRIPT_DIR / "fixtures/issue_2737_pr_a_cleanup_contract.json"
+CONTRACT = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
 
 sys.path.insert(0, str(SCRIPT_DIR))
 from codex_refactor_loop.issue_2737_recovery import (  # noqa: E402
@@ -26,6 +27,39 @@ from test_issue_2737_recovery import record_bytes  # noqa: E402
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _reviewed_content_digest(files: dict[str, tuple[str, bytes]]) -> str:
+    """Bind the complete reviewed content without requiring a self-hashing Git tree."""
+    projected: list[bytes] = []
+    contract_path = CONTRACT_PATH.relative_to(REPO_ROOT).as_posix()
+    for path, (mode, data) in sorted(files.items()):
+        if path == contract_path:
+            contract = json.loads(data)
+            contract["reviewed_content_sha256"] = "0" * 64
+            data = json.dumps(contract, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode()
+        projected.extend((path.encode(), b"\0", mode.encode(), b"\0", hashlib.sha256(data).digest()))
+    return _digest(b"".join(projected))
+
+
+def _tracked_worktree_files() -> dict[str, tuple[str, bytes]]:
+    raw = subprocess.run(
+        ["git", "ls-files", "-s", "-z"], cwd=REPO_ROOT, capture_output=True, check=True,
+    ).stdout
+    files: dict[str, tuple[str, bytes]] = {}
+    for entry in raw.split(b"\0")[:-1]:
+        metadata, raw_path = entry.split(b"\t", 1)
+        mode = metadata.split(b" ", 1)[0].decode("ascii")
+        path = raw_path.decode("utf-8")
+        target = REPO_ROOT / path
+        if mode in ("100644", "100755"):
+            data = target.read_bytes()
+        elif mode == "120000":
+            data = os.readlink(target).encode()
+        else:
+            raise ValueError(f"unsupported reviewed content mode: {mode}:{path}")
+        files[path] = (mode, data)
+    return files
 
 
 def _cleanup_tree_errors(files: dict[str, bytes], changed: dict[str, str]) -> list[str]:
@@ -276,7 +310,7 @@ def _candidate_cleanup_tree() -> tuple[dict[str, bytes], dict[str, str]]:
     for path in CONTRACT["temporary_whole_files"] + [CONTRACT["future_occurrence_path"]]:
         files.pop(path, None)
     for path in CONTRACT["restored_base_sha256"]:
-        files[path] = _git_bytes(CONTRACT["base_commit"], path)
+        files[path] = _git_bytes(CONTRACT["cleanup_restore_commit"], path)
 
     controller_path = "skills/consensus-loop/scripts/codex_refactor_loop/controller_actions.py"
     controller_text = files[controller_path].decode()
@@ -388,11 +422,8 @@ def _build_review_history(
 class FrozenOwnershipClosureTests(unittest.TestCase):
     def test_current_pr_a_matches_complete_frozen_owner_closure(self):
         self.assertEqual(
-            [CONTRACT["base_commit"], CONTRACT["base_tree"]],
-            subprocess.run(
-                ["git", "rev-parse", "HEAD", "HEAD^{tree}"], cwd=REPO_ROOT,
-                text=True, capture_output=True, check=True,
-            ).stdout.splitlines(),
+            CONTRACT["reviewed_content_sha256"],
+            _reviewed_content_digest(_tracked_worktree_files()),
         )
         for path in CONTRACT["temporary_whole_files"]:
             self.assertTrue((REPO_ROOT / path).is_file(), path)
@@ -437,6 +468,24 @@ class FrozenOwnershipClosureTests(unittest.TestCase):
         for path in CONTRACT["forbidden_route_owners"]:
             text = (REPO_ROOT / path).read_text(encoding="utf-8")
             self.assertFalse(any(name in text for name in CONTRACT["temporary_controller_members"]), path)
+
+    def test_reviewed_content_projection_is_self_stable_and_rejects_drift(self):
+        files = _tracked_worktree_files()
+        exact = _reviewed_content_digest(files)
+        contract_path = CONTRACT_PATH.relative_to(REPO_ROOT).as_posix()
+        mode, contract_bytes = files[contract_path]
+        changed_contract = json.loads(contract_bytes)
+        changed_contract["reviewed_content_sha256"] = "f" * 64
+        self_only = {
+            **files,
+            contract_path: (mode, json.dumps(changed_contract).encode()),
+        }
+        self.assertEqual(exact, _reviewed_content_digest(self_only))
+
+        drift_path = "skills/consensus-loop/scripts/codex_refactor_loop/issue_2737_recovery.py"
+        drift_mode, drift_bytes = files[drift_path]
+        drifted = {**files, drift_path: (drift_mode, drift_bytes + b"\n")}
+        self.assertNotEqual(exact, _reviewed_content_digest(drifted))
 
     def test_actual_candidate_cleanup_diff_tree_and_surviving_gates(self):
         files, changed = _candidate_cleanup_tree()

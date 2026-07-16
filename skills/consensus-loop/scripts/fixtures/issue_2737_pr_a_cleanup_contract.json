@@ -1,6 +1,6 @@
 {
-  "base_commit": "8152289d456f178636483a3921efe5b7067fdbe4",
-  "base_tree": "41826f7b4f0af4952dd1df55cfc78092c299b6ba",
+  "cleanup_restore_commit": "8152289d456f178636483a3921efe5b7067fdbe4",
+  "reviewed_content_sha256": "78b3f94957ee4c632729725bd920be16c54e2bed6232bb722ca67fb21acc1022",
   "future_occurrence_path": "skills/consensus-loop/authorizations/issue-2737-reselection.json",
   "temporary_whole_files": [
     "skills/consensus-loop/scripts/codex_refactor_loop/issue_2737_recovery.py",

@@ -61,6 +61,7 @@ from .issue_decomposition import (
     IssueDecompositionPlan,
     IssueDecompositionTrackingChild,
     append_issue_decomposition_tracking_block,
+    build_issue_decomposition_apply_projection,
     extract_issue_decomposition_child_fingerprint,
     issue_decomposition_child_fingerprint,
     issue_decomposition_expected_child_fingerprints,
@@ -71,6 +72,7 @@ from .issue_decomposition import (
 )
 from .managed_work_snapshot import invalidate_open_managed_work_snapshot, load_open_managed_work_snapshot
 from .prompt_rendering import render_prompt_text
+from .pr_checks import PrMergeReadinessProjection
 from .processes import launch_spawn_codex_supervisor
 from .publish_verification import (
     PublishVerificationJobResult,
@@ -1141,35 +1143,31 @@ class ControllerActions:
             expected_parent_issue=plan.parent_issue,
             expected_digest=digest,
         )
-        try:
-            tracked_children = reconcile_issue_decomposition_tracking_children(plan, digest, projection)
-        except IssueDecompositionError as exc:
-            raise RuntimeError(f"apply_issue_decomposition_plan: invalid parent tracking comments: {exc}") from exc
-        existing_children = self._issue_decomposition_existing_children_by_fingerprint(plan, digest)
-        children_by_slug: dict[str, IssueDecompositionTrackingChild] = dict(tracked_children)
-        children_by_slug.update({child.slug: child for child in existing_children.values()})
-        missing = [child for child in plan.children if child.slug not in children_by_slug]
+        apply_projection = build_issue_decomposition_apply_projection(
+            plan,
+            digest,
+            projection,
+            self._issue_decomposition_existing_children_by_fingerprint(plan, digest),
+            live_duplicate=self._issue_decomposition_live_child_by_fingerprint,
+        )
+        if apply_projection.conflicts:
+            raise RuntimeError(f"apply_issue_decomposition_plan: invalid parent tracking comments: {'; '.join(apply_projection.conflicts)}")
+        children_by_slug = {child.slug: child for child in apply_projection.children}
         created: list[tuple[int, str]] = []
-        for child in missing:
-            fingerprint = issue_decomposition_child_fingerprint(plan.parent_issue, digest, child.slug)
-            live_duplicate = self._issue_decomposition_live_child_by_fingerprint(child.slug, fingerprint)
-            if live_duplicate is not None:
-                children_by_slug[child.slug] = live_duplicate
-                continue
-            self._write_issue_decomposition_child_body_fingerprint(child, fingerprint)
+        for proposed in apply_projection.creates:
+            child = proposed.child
+            self._write_issue_decomposition_child_body_fingerprint(child, proposed.fingerprint)
             number, url = self.open_design_issue_with_labels(child.title, child.body_artifact_path)
             created.append((number, url))
             children_by_slug[child.slug] = IssueDecompositionTrackingChild(
                 slug=child.slug,
                 issue_number=number,
                 url=url,
-                fingerprint=fingerprint,
+                fingerprint=proposed.fingerprint,
             )
-        if created:
+        if apply_projection.invalidate_snapshot:
             invalidate_open_managed_work_snapshot(self.ctx)
-        expected_slugs = {child.slug for child in plan.children}
-        if not created and set(tracked_children) == expected_slugs:
-            invalidate_open_managed_work_snapshot(self.ctx)
+        if not apply_projection.parent_comment_required:
             return tuple()
         parent_comment = (self.ctx.repo_root / plan.parent_comment_artifact_path).read_text(encoding="utf-8")
         final_sentinel = f"\n{FINAL_SENTINEL}\n"
@@ -1203,6 +1201,198 @@ class ControllerActions:
             record_content_creation_backoff(self.ctx, "issue-decomposition-parent-comment", result)
             raise RuntimeError(f"apply_issue_decomposition_plan: parent comment failed: {result.stderr.strip() or result.stdout.strip()}")
         return tuple(created)
+
+    def recover_issue_2737_partial_decomposition(self, *, verify_only: bool = False):
+        """Run the temporary fork-private, incident-bound recovery in process."""
+        from .issue_2737_recovery import Issue2737Recovery
+
+        return Issue2737Recovery(self).run(verify_only=verify_only)
+
+    def _validate_issue_2737_occurrence(self):
+        from .issue_2737_recovery import validate_live_occurrence
+
+        return validate_live_occurrence(self)
+
+    def _revalidate_issue_2737_effect_admission(self, effect: object) -> None:
+        from .issue_2737_recovery import Issue2737Effect, literal_effect_target
+
+        if not isinstance(effect, Issue2737Effect):
+            raise RuntimeError("issue-2737-recovery:invalid-effect-admission")
+        self._require_owner_or_raise("recover-issue-2737-partial-decomposition")
+        admission = self._require_github_actor_or_raise("recover-issue-2737-partial-decomposition")
+        if admission.login != "eanz17" or admission.repo_slug != "aevatarAI/aevatar":
+            raise RuntimeError("issue-2737-recovery:actor-or-repository")
+        target = self._normalize_lifecycle_target_or_raise(
+            literal_effect_target(effect),
+            kind="issue",
+            action="recover-issue-2737-partial-decomposition",
+            source="literal-capability",
+        )
+        denied = self._require_item_write_admission_or_return(
+            "recover-issue-2737-partial-decomposition", "issue", target, current_login=admission.login
+        )
+        if denied is not None:
+            raise RuntimeError("issue-2737-recovery:item-write-admission")
+
+    def _issue_2737_live_observation(self, occurrence: object) -> Mapping[str, Any]:
+        from .issue_2737_recovery import acquire_live_observation
+
+        return acquire_live_observation(self, occurrence)
+
+    def _issue_2737_pr_readiness(self, repository: str, pr_number: int):
+        return PrMergeReadinessProjection(
+            runner=lambda command: self._cross_instance_runner(command, self.repo_root), cwd=self.repo_root
+        ).check_pr(repository, pr_number)
+
+    def _issue_2737_pr_binding_projection(self, record: Mapping[str, Any], *, authorization: bool) -> Mapping[str, Any]:
+        repository = "eanz17/consensus-rnd"
+        number = int(record["number"] if authorization else record["pr_number"])
+        origin = self.git(["remote", "get-url", "origin"], check=False)
+        object_format = self.git(["rev-parse", "--show-object-format"], check=False)
+        if (origin.returncode != 0 or origin.stdout.strip() not in (
+            "git@github.com:eanz17/consensus-rnd.git", "https://github.com/eanz17/consensus-rnd.git"
+        ) or object_format.returncode != 0 or object_format.stdout.strip() not in ("sha1", "sha256")):
+            raise RuntimeError("issue-2737-recovery:checkout-repository")
+        for marker in ("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"):
+            marker_path = self.git(["rev-parse", "--git-path", marker], check=False)
+            if marker_path.returncode != 0 or Path(marker_path.stdout.strip()).exists():
+                raise RuntimeError(f"issue-2737-recovery:checkout-operation:{marker}")
+        fetched = self.git(["fetch", "--no-tags", "origin", f"pull/{number}/head", f"pull/{number}/merge"], check=False)
+        if fetched.returncode != 0:
+            raise RuntimeError("issue-2737-recovery:pull-fetch")
+        result = self.gh(["api", f"repos/{repository}/pulls/{number}"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError("issue-2737-recovery:pull-unavailable")
+        try:
+            pull = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("issue-2737-recovery:pull-json") from exc
+        if not isinstance(pull, Mapping) or pull.get("state") != "closed" or not pull.get("merged"):
+            raise RuntimeError("issue-2737-recovery:pull-not-merged")
+        head = pull.get("head") if isinstance(pull.get("head"), Mapping) else {}
+        base = pull.get("base") if isinstance(pull.get("base"), Mapping) else {}
+        head_repo = head.get("repo") if isinstance(head.get("repo"), Mapping) else {}
+        base_repo = base.get("repo") if isinstance(base.get("repo"), Mapping) else {}
+        if str(head_repo.get("full_name") or "") != repository or str(base_repo.get("full_name") or "") != repository:
+            raise RuntimeError("issue-2737-recovery:pull-repository")
+        merge_sha = str(pull.get("merge_commit_sha") or "")
+        head_sha = str(head.get("sha") or "")
+        if authorization:
+            if str(base.get("ref") or "") != record["base_ref"] or str(head.get("ref") or "") != record["head_ref"]:
+                raise RuntimeError("issue-2737-recovery:authorization-refs")
+            expected_base = str(record["expected_base_sha"])
+            if str(base.get("sha") or "") != expected_base:
+                raise RuntimeError("issue-2737-recovery:authorization-base-drift")
+        else:
+            if head_sha != record["reviewed_head_sha"] or merge_sha != record["merge_sha"]:
+                raise RuntimeError("issue-2737-recovery:implementation-pr-drift")
+            expected_base = str(base.get("sha") or "")
+        parents = self.git(["show", "-s", "--format=%P", merge_sha], check=False)
+        tree = self.git(["show", "-s", "--format=%T", merge_sha], check=False)
+        head_tree = self.git(["show", "-s", "--format=%T", head_sha], check=False)
+        if any(item.returncode != 0 for item in (parents, tree, head_tree)):
+            raise RuntimeError("issue-2737-recovery:git-object-unavailable")
+        if parents.stdout.strip().split() != [expected_base, head_sha] or tree.stdout.strip() != head_tree.stdout.strip():
+            raise RuntimeError("issue-2737-recovery:merge-topology")
+        if not authorization and (tree.stdout.strip() != record["merge_tree_oid"] or head_tree.stdout.strip() != record["reviewed_tree_oid"]):
+            raise RuntimeError("issue-2737-recovery:implementation-tree-drift")
+        if not authorization:
+            files = self.gh(["api", f"repos/{repository}/pulls/{number}/files", "--paginate", "--slurp"], check=False)
+            diff = self.git(["diff", "--name-status", "-z", expected_base, head_sha], check=False)
+            if files.returncode != 0 or diff.returncode != 0:
+                raise RuntimeError("issue-2737-recovery:implementation-files")
+            try:
+                api_pages = json.loads(files.stdout or "[]")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("issue-2737-recovery:implementation-files-json") from exc
+            api_paths = [str(row.get("filename") or "") for row in _flatten_gh_pages(api_pages)
+                         if isinstance(row, Mapping) and row.get("status") in ("added", "modified") and not row.get("previous_filename")]
+            fields = diff.stdout.split("\0")
+            if not fields or fields[-1] != "":
+                raise RuntimeError("issue-2737-recovery:implementation-diff-truncated")
+            git_paths: list[str] = []
+            for index in range(0, len(fields) - 1, 2):
+                status, path = fields[index:index + 2]
+                if status not in ("A", "M") or not path:
+                    raise RuntimeError("issue-2737-recovery:implementation-diff-kind")
+                git_paths.append(path)
+            bound_paths = [str(row["path"]) for row in record["bound_files"]]
+            if sorted(api_paths) != bound_paths or sorted(git_paths) != bound_paths or len(api_paths) != len(bound_paths) or len(git_paths) != len(bound_paths):
+                raise RuntimeError("issue-2737-recovery:implementation-files-disagree")
+            for bound in record["bound_files"]:
+                path = str(bound["path"])
+                head_entry = self.git(["ls-tree", head_sha, "--", path], check=False)
+                merge_entry = self.git(["ls-tree", merge_sha, "--", path], check=False)
+                local = self.repo_root / path
+                if head_entry.returncode != 0 or merge_entry.returncode != 0 or head_entry.stdout != merge_entry.stdout or not local.is_file():
+                    raise RuntimeError("issue-2737-recovery:implementation-file")
+                parts = head_entry.stdout.split()
+                if len(parts) < 4 or parts[0] != "100644" or parts[2] != bound["blob_oid"] or hashlib.sha256(local.read_bytes()).hexdigest() != bound["sha256"]:
+                    raise RuntimeError("issue-2737-recovery:implementation-file-drift")
+        projection: dict[str, Any] = {"admitted": True, "head_sha": head_sha, "merge_sha": merge_sha, "base_sha": expected_base}
+        if authorization:
+            files = self.gh(["api", f"repos/{repository}/pulls/{number}/files", "--paginate", "--slurp"], check=False)
+            diff = self.git(["diff", "--name-status", "-z", expected_base, head_sha], check=False)
+            if files.returncode != 0 or diff.returncode != 0:
+                raise RuntimeError("issue-2737-recovery:authorization-files")
+            api_pages = json.loads(files.stdout or "[]")
+            api_files = [row for page in api_pages for row in (page if isinstance(page, list) else [page]) if isinstance(row, Mapping)]
+            fields = diff.stdout.split("\0")
+            git_files = []
+            for index in range(0, len(fields) - 1, 2):
+                status, path = fields[index:index + 2]
+                mode = self.git(["ls-tree", head_sha, "--", path], check=False).stdout.split(None, 1)[0]
+                git_files.append((path, status, mode))
+            record_path = self.repo_root / "skills/consensus-loop/authorizations/issue-2737-reselection.json"
+            blob = self.git(["hash-object", str(record_path)], check=False)
+            head_blob = self.git(["rev-parse", f"{head_sha}:skills/consensus-loop/authorizations/issue-2737-reselection.json"], check=False)
+            merge_blob = self.git(["rev-parse", f"{merge_sha}:skills/consensus-loop/authorizations/issue-2737-reselection.json"], check=False)
+            status = self.git(["status", "--porcelain=v1", "--untracked-files=all"], check=False)
+            branch = self.git(["symbolic-ref", "-q", "HEAD"], check=False)
+            exact_blob = blob.returncode == head_blob.returncode == merge_blob.returncode == 0 and len({blob.stdout.strip(), head_blob.stdout.strip(), merge_blob.stdout.strip()}) == 1
+            projection.update(api_files=api_files, git_files=git_files, record_blob_oid=blob.stdout.strip(), checkout_admitted=exact_blob and status.returncode == 0 and not status.stdout and branch.returncode != 0 and tree.stdout.strip() == self.git(["show", "-s", "--format=%T", "HEAD"], check=False).stdout.strip())
+        return projection
+
+    def _issue_2737_review_projection(self, implementation: Mapping[str, Any]) -> Mapping[str, Any]:
+        repository = str(implementation["fork_repository"])
+        number = int(implementation["pr_number"])
+        result = self.gh(["api", f"repos/{repository}/issues/{number}/comments", "--paginate", "--slurp"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError("issue-2737-recovery:review-unavailable")
+        evidences: list[ParsedGithubReviewEvidence] = []
+        for index, row in enumerate(_flatten_gh_pages(json.loads(result.stdout or "[]"))):
+            parsed = parse_github_review_evidence(str(row.get("body") or ""), number, source="github:issues/comments", created_at=str(row.get("created_at") or ""), source_index=index, comment_id=int(row["id"]) if isinstance(row.get("id"), int) else None)
+            if parsed is not None:
+                evidences.append(parsed)
+        selection = select_latest_live_head_review_evidence(evidences, live_head_sha=str(implementation["reviewed_head_sha"]), required_roles=REVIEW_ROLES)
+        admitted = not selection.invalid and not selection.pending and not selection.terminal_failed_roles and set(selection.by_role) == set(REVIEW_ROLES)
+        if admitted:
+            verdicts = {str(selection.by_role[role].verdict) for role in REVIEW_ROLES}
+            admitted = "reject" not in verdicts and "approve" in verdicts
+        return {"admitted": admitted}
+
+    def _issue_2737_decomposition_projection(self, raw: Mapping[str, Any]):
+        incident = raw["incident"]
+        plan = load_issue_decomposition_plan(self.ctx, str(incident["plan_path"]))
+        digest = issue_decomposition_plan_file_digest(self.ctx, str(incident["plan_path"]))
+        if digest != incident["plan_digest"]:
+            raise RuntimeError("issue-2737-recovery:plan-digest")
+        comments = self._issue_decomposition_parent_comments(str(incident["parent_issue"]))
+        tracking = parse_issue_decomposition_tracking_comments(
+            comments, expected_parent_issue=plan.parent_issue, expected_digest=digest
+        )
+        return build_issue_decomposition_apply_projection(
+            plan,
+            digest,
+            tracking,
+            self._issue_decomposition_existing_children_by_fingerprint(plan, digest),
+            live_duplicate=self._issue_decomposition_live_child_by_fingerprint,
+        )
+
+    def _issue_2737_target_projection(self, raw: Mapping[str, Any]) -> Mapping[str, Any]:
+        from .issue_2737_recovery import read_target_projection
+
+        return read_target_projection(self, raw)
 
     def apply_default_issue_intake_claim(self, issue_number: int) -> DefaultIssueIntakeResult:
         self._require_owner_or_raise("apply-default-issue-intake-claim")

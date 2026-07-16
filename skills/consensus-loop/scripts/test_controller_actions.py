@@ -4065,7 +4065,7 @@ class ControllerActionsTests(unittest.TestCase):
         self.assertEqual("issue-decomposition-parent-comment", backoff["contentCreation"]["operation"])
         self.assertEqual("secondary-content-creation-limit", backoff["contentCreation"]["reason"])
 
-    def test_apply_issue_decomposition_plan_reuses_complete_tracking_and_reconciles_duplicate_matching_comments(self) -> None:
+    def test_apply_issue_decomposition_plan_reuses_complete_tracking_for_fingerprintless_children_and_reconciles_duplicate_matching_comments(self) -> None:
         consensus = ".refactor-loop/runs/phase9-issue403-r6-judge.md"
         (self.tmp / ".refactor-loop" / "runs").mkdir(parents=True, exist_ok=True)
         (self.tmp / consensus).write_text("consensus artifact\n", encoding="utf-8")
@@ -4163,7 +4163,7 @@ class ControllerActionsTests(unittest.TestCase):
                     [["issue", "view", "403", "--json", "comments"]],
                     gh_calls,
                 )
-                self.assertFalse(stale_snapshot.exists(), "idempotent decomposition reentry must invalidate stale managed-work snapshot")
+                self.assertTrue(stale_snapshot.exists(), "complete decomposition reentry must remain a total no-op")
 
     def test_apply_issue_decomposition_plan_fails_closed_on_conflicting_tracking_comment(self) -> None:
         consensus = ".refactor-loop/runs/phase9-issue403-r6-judge.md"
